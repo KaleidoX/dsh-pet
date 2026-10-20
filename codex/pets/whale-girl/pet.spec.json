@@ -1,0 +1,26 @@
+{
+  "id": "whale-girl",
+  "displayName": "鲸鱼娘",
+  "description": "Q版蓝发小女仆，头顶呆毛、耳侧鳍饰，身后拖着鲸鱼尾巴。",
+  "sourceDir": "dsh-pet/assets/webm",
+  "ground": 330,
+  "standardBase": 199,
+  "lookBase": 191,
+  "rows": {
+    "0": { "animation": "待机呼吸休闲", "frames": [1, 18, 36, 50, 60, 76], "axis": 314, "scale": 0.66 },
+    "1": { "animation": "原地左转奔跑", "frames": [60, 63, 66, 69, 72, 75, 78, 81], "axis": 344, "scale": 0.66, "mirror": true },
+    "2": { "animation": "原地左转奔跑", "frames": [60, 63, 66, 69, 72, 75, 78, 81], "axis": 344, "scale": 0.66 },
+    "3": { "animation": "点击回应-元气挥手", "frames": [49, 62, 86, 210], "axis": 313, "scale": 0.66 },
+    "4": { "animation": "点击回应-开心跃动", "frames": [93, 105, 120, 138, 158], "axis": 320, "scale": 0.6 },
+    "5": { "animation": "工作状态-垂头叹气冒汗", "frames": [100, 103, 106, 109, 112, 115, 117, 118], "axis": 316, "scale": 0.66 },
+    "6": { "animation": "工作状态-思考冒泡", "frames": [40, 55, 70, 90, 108, 120], "axis": 310, "scale": 0.66 },
+    "7": { "animation": "写代码", "frames": [85, 91, 97, 103, 109, 115], "axis": 318, "scale": 0.66 },
+    "8": { "animation": "工作状态-清点归档", "frames": [50, 64, 78, 92, 106, 120], "axis": 311, "scale": 0.66 }
+  },
+  "look": {
+    "animation": "小幅度原地360度旋转展示",
+    "frames": [33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 73, 77, 80],
+    "axis": 322,
+    "scale": 0.63
+  }
+}

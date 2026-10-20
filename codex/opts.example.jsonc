@@ -1,0 +1,24 @@
+// 构建脚本的本地配置模板。
+// 复制为同目录下的 opts.jsonc 后按需修改；opts.jsonc 只属于本机，不要提交。
+// 所有字段都可省略；优先级：命令行参数 > 环境变量 > 本文件 > 内置默认值。
+{
+  // Codex 的配置根目录；宠物安装到 <codexHome>/pets/<id>/。
+  // 默认 ~/.codex，与 Codex 桌面应用一致；设置了 CODEX_HOME 时可直接写用环境变量。
+  "codexHome": "~/.codex",
+
+  // 官方 validate_atlas.py 的路径（随 Codex 桌面应用发布）。
+  // 留空或删除则跳过官方校验；各平台常见位置见 README。
+  "validateAtlas": "",
+
+  // 从 webm 抽出的帧缓存目录。
+  "cacheDir": "~/.cache/dsh-pet-codex/frames",
+
+  // 构建产物（spritesheet.webp）的存放目录。
+  "outDir": "~/.cache/dsh-pet-codex/out",
+
+  // build 完成后是否自动安装到 codexHome；对应 --no-install。
+  "install": true,
+
+  // 忽略帧缓存，每次都重新抽帧；对应 --force-extract。
+  "forceExtract": false
+}

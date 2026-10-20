@@ -16,6 +16,9 @@ prproj/
 # ── 本地工具（机器相关，不入仓库） ──
 .tools/
 
+# ── Codex 宠物构建的本地配置（模板 codex/opts.example.jsonc 入库） ──
+codex/opts.jsonc
+
 # ── Python ──
 __pycache__/
 *.py[cod]
