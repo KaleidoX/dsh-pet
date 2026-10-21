@@ -1,0 +1,23 @@
+[package]
+name = "whale-pet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "whale-pet"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+log.workspace = true
+pet-config.workspace = true
+pet-ui-egui.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

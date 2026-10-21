@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+default-members = ["crates/*", "apps/whale-pet", "xtask"]
+
+# whale-pet needs one thing egui-winit cannot do upstream: create a transparent
+# Windows window without a DWM redirection surface (`WS_EX_NOREDIRECTIONBITMAP`),
+# which winit only accepts at creation time. The fork carries that single
+# addition; see third_party/egui-winit/Cargo.toml.
+[patch.crates-io]
+egui-winit = { path = "third_party/egui-winit" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.95"
+repository = "https://github.com/KaleidoX/dsh-pet"
+
+[workspace.dependencies]
+# 内部 crate（分层：pet-config → pet-model → pet-decode → pet-ui-egui → apps/whale-pet）
+pet-config = { path = "crates/pet-config" }
+pet-model = { path = "crates/pet-model" }
+pet-decode = { path = "crates/pet-decode" }
+pet-ui-egui = { path = "crates/pet-ui-egui" }
+
+# 外部依赖（版本与实测锁定，见 .agents/findings.md 第 10、11 节）
+anyhow = "1.0.104"
+eframe = "0.37.0"
+egui = "0.37.0"
+env_logger = "0.11.11"
+fastrand = "2.5.0"
+ffmpeg-next = { version = "7.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+log = "0.4.34"
+raw-window-handle = "0.6.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json_lenient = "0.2.4"
+sha2 = "0.10.9"
+winit = "0.30.13"
+x11rb = { version = "0.13.2", features = ["shape"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 0

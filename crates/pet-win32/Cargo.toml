@@ -1,0 +1,14 @@
+[package]
+name = "pet-win32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The only crate allowed to call Win32 directly; see src/lib.rs"
+
+# Deliberately does NOT set `[lints] workspace = true`: the workspace forbids
+# `unsafe_code`, and the two calls below have no safe equivalent in winit 0.30.
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
