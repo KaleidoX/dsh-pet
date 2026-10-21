@@ -1,13 +1,32 @@
-# dsh-pet 🐳
+# whale-pet 🐳
 
-这是 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 的衍生仓库，在原项目基础上加入了 **Codex 桌面应用**的自定义桌宠包——**鲸鱼娘（Whale Girl）**。
+**whale-pet** 是基于 egui 的跨平台独立桌面桌宠：单窗口、640×360 原尺寸透明动画，支持待机、拖动与点击回应。角色是 **鲸鱼娘（Whale Girl）**——Q 版蓝发小女仆，头顶呆毛、耳侧鳍饰，身后拖着鲸鱼尾巴。
+
+本仓库同时是 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 的衍生仓库，保留了上游插件源码与其素材，并额外提供 **Codex 桌面应用**的自定义桌宠包。
 
 > **维护范围**：本仓库**不负责** dsh-pet 插件本身，也**不负责**原项目的桌面端（Electron 透明窗）。插件的安装、配置、问题反馈与发版，请前往原项目：
 > <https://github.com/PC2005-cloud/dsh-pet>
 
+## 🖥️ 独立桌面应用（whale-pet）
+
+Rust + egui 实现的独立桌宠：单窗口、置顶、透明，直接播放上游的 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。目前支持 Linux（X11/XWayland）与 Windows。
+
+```sh
+cargo xtask build-ffmpeg --target linux   # 准备解码库
+cargo xtask run                           # 构建并启动
+```
+
+```sh
+whale-pet [--asset-dir <DIR>] [--stats]
+```
+
+拖动可移动窗口，点击会有回应，`Ctrl+Q` 退出。素材根默认取仓库内的 `dsh-pet/assets`，也可以用 `--asset-dir` 或 `WHALE_PET_ASSET_DIR` 指定位置。
+
+构建细节、平台实现限制与实测数据见 [`docs/whale-pet.md`](docs/whale-pet.md)。
+
 ## 🐳 Codex 桌宠包（鲸鱼娘 / Whale Girl）
 
-角色取自本项目的透明动画素材：Q 版蓝发小女仆——头顶呆毛、耳侧鳍饰，身后拖着鲸鱼尾巴。宠物包内含现成图集，也含可复现的构建脚本（抽帧 → 拼 1536×2288 图集 → 官方校验 → 安装）。
+角色取自本项目的透明动画素材。宠物包内含现成图集，也含可复现的构建脚本（抽帧 → 拼 1536×2288 图集 → 官方校验 → 安装）。
 
 在仓库根目录执行：
 
