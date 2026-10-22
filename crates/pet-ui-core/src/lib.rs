@@ -105,6 +105,10 @@ pub struct PetCore {
     play_gen: u64,
     texture: Option<egui::TextureHandle>,
     texture_key: Option<(u64, u64)>,
+    /// When the current clip was first seen without a frame while a previous
+    /// texture was on screen: the pet keeps showing that texture until the new
+    /// clip's first frame arrives (logged when it does).
+    hold_since: Option<Instant>,
     next_due: Option<Duration>,
     /// Start of the Q-squash; `None` when no squash is running.
     squash: Option<Instant>,
@@ -137,6 +141,7 @@ impl PetCore {
             play_gen: 0,
             texture: None,
             texture_key: None,
+            hold_since: None,
             next_due: None,
             squash: None,
             pending_squash: false,
@@ -344,15 +349,26 @@ impl PetCore {
 
     /// Uploads the current frame when it changed and paints it at native size.
     fn paint(&mut self, ui: &mut egui::Ui, now: Instant, ppp: f32) {
-        let Some(frame) = self.player.current() else { return };
-        let key = (self.play_gen, self.player.seq());
-        if self.texture_key != Some(key) {
-            let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
-            match &mut self.texture {
-                Some(texture) if texture.size() == [frame.width, frame.height] => texture.set(image, TextureOptions::LINEAR),
-                _ => self.texture = Some(ui.ctx().load_texture("pet-frame", image, TextureOptions::LINEAR)),
+        // A fresh clip has no frame until its decoder thread has opened the file
+        // and decoded the first one. Hosts clear their surface every frame, so
+        // returning without painting would blank the pet for that gap on every
+        // clip switch; the previous texture stays on screen instead, the same
+        // way a clip that ended keeps showing its last frame.
+        if let Some(frame) = self.player.current() {
+            if let Some(since) = self.hold_since.take() {
+                log::debug!("{} produced its first frame after {:.0} ms", self.clip_name, (now - since).as_secs_f32() * 1000.0);
             }
-            self.texture_key = Some(key);
+            let key = (self.play_gen, self.player.seq());
+            if self.texture_key != Some(key) {
+                let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
+                match &mut self.texture {
+                    Some(texture) if texture.size() == [frame.width, frame.height] => texture.set(image, TextureOptions::LINEAR),
+                    _ => self.texture = Some(ui.ctx().load_texture("pet-frame", image, TextureOptions::LINEAR)),
+                }
+                self.texture_key = Some(key);
+            }
+        } else if self.texture.is_some() {
+            self.hold_since.get_or_insert(now);
         }
         let Some(texture) = &self.texture else { return };
 
