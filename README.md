@@ -9,7 +9,7 @@
 
 ## 🖥️ 独立桌面应用（whale-pet）
 
-Rust + egui 实现的独立桌宠：单窗口、置顶、透明，直接播放上游的 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。目前支持 Linux（X11/XWayland）与 Windows。
+Rust + egui 实现的独立桌宠：单窗口、置顶、透明，直接播放上游的 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。支持 Linux（Wayland 原生 layer shell 与 X11/XWayland）与 Windows。
 
 ```sh
 cargo xtask build-ffmpeg --target linux   # 准备解码库
@@ -17,10 +17,10 @@ cargo xtask run                           # 构建并启动
 ```
 
 ```sh
-whale-pet [--asset-dir <DIR>] [--stats]
+whale-pet [--asset-dir <DIR>] [--stats] [--force-x11 | --force-wayland]
 ```
 
-拖动可移动窗口，点击会有回应，`Ctrl+Q` 退出。素材根默认取仓库内的 `dsh-pet/assets`，也可以用 `--asset-dir` 或 `WHALE_PET_ASSET_DIR` 指定位置。
+拖动可移动窗口，点击会有回应，`Ctrl+Q` 退出。素材根默认取仓库内的 `dsh-pet/assets`，也可以用 `--asset-dir` 或 `WHALE_PET_ASSET_DIR` 指定位置。Wayland 会话下默认走原生 layer shell，初始化失败会自动回退 XWayland。
 
 构建细节、平台实现限制与实测数据见 [`docs/whale-pet.md`](docs/whale-pet.md)。
 
