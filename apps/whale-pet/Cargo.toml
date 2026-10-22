@@ -19,5 +19,8 @@ pet-config.workspace = true
 pet-ui-egui.workspace = true
 winit.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+pet-wayland.workspace = true
+
 [lints]
 workspace = true

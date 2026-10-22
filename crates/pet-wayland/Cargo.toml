@@ -1,0 +1,36 @@
+[package]
+name = "pet-wayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Native Wayland (wlr-layer-shell) host for whale-pet; see src/lib.rs"
+
+# Deliberately does NOT set `[lints] workspace = true`: the workspace forbids
+# `unsafe_code`, and building a wgpu surface from a raw `wl_surface` pointer has
+# no safe equivalent. Every `unsafe` block lives in `src/ffi.rs`, mirroring the
+# `pet-win32` crate. Workspace-level `cargo clippy -- -D warnings` still checks
+# this crate.
+#
+# `anyhow` and `pet-config` stay in the unconditional dependencies so the
+# non-Linux stub of `run` can be type-checked by a Windows cross build.
+
+[dependencies]
+anyhow.workspace = true
+pet-config.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+calloop.workspace = true
+calloop-wayland-source.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+log.workspace = true
+pet-ui-core.workspace = true
+pollster.workspace = true
+raw-window-handle.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-backend.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wgpu.workspace = true

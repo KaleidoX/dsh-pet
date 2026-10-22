@@ -16,7 +16,8 @@
 //! Dragging moves the native window with the same spring the web client uses; a
 //! click (press + release without crossing the drag threshold) plays a random
 //! click clip with the squash-and-rebound animation, and clips play once before
-//! falling back to the idle pool.
+//! falling back to the idle pool. The behaviour itself lives in `pet-ui-core`;
+//! this crate only feeds it winit's input and applies the result to the window.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,10 +25,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, TextureOptions, Vec2};
-use pet_config::{CANVAS_H, CANVAS_W, DRAG_THRESHOLD, HIT_BOX, PetConfig, SQ_DURATION_SECS, SQ_SQUASH, clip_path};
-use pet_decode::Player;
-use pet_model::{AnimPools, Spring2, squash_scale};
+#[cfg(target_os = "windows")]
+use egui::{Pos2, Vec2};
+#[cfg(target_os = "windows")]
+use pet_config::HIT_BOX;
+use pet_config::{CANVAS_H, CANVAS_W, PetConfig};
+use pet_ui_core::{FrameInput, PetCore, corner_position};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
@@ -99,52 +102,8 @@ pub fn run(asset_dir: PathBuf, config: PetConfig, options: RunOptions) -> eframe
     )
 }
 
-/// What the currently playing clip represents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Idle,
-    Drag,
-    Click,
-}
-
-/// A pointer press that has not been released yet.
-#[derive(Debug, Clone, Copy)]
-struct Press {
-    /// Pointer position in window points when the button went down.
-    start: Pos2,
-    /// Pointer offset from the window centre, in canvas pixels.
-    off: Vec2,
-    /// Set once the pointer travelled past [`DRAG_THRESHOLD`].
-    dragging: bool,
-    /// Window position in physical pixels, integrated by the drag spring.
-    spring: Option<Spring2>,
-}
-
 struct PetApp {
-    asset_dir: PathBuf,
-    pools: AnimPools,
-    throw_power: f32,
-    player: Player,
-    clip_name: String,
-    mode: Mode,
-    /// The current clip already reached its end (handled once).
-    clip_done: bool,
-    /// Number of consecutive clips that delivered zero frames.
-    failed_clips: u32,
-    /// Gave up on decoding: no further repaints are scheduled.
-    stalled: bool,
-    /// Bumped on every clip switch, so texture uploads can tell clips apart.
-    play_gen: u64,
-    texture: Option<egui::TextureHandle>,
-    texture_key: Option<(u64, u64)>,
-    next_due: Option<Duration>,
-    /// Start of the Q-squash; `None` when no squash is running.
-    squash: Option<Instant>,
-    /// A click was played and the squash starts with its first frame.
-    pending_squash: bool,
-    press: Option<Press>,
-    /// The pointer has been seen with the left button down at least once.
-    saw_button_down: bool,
+    core: PetCore,
     window: Arc<Window>,
     ppp: f32,
     last_pos: PhysicalPosition<i32>,
@@ -167,7 +126,6 @@ struct PetApp {
     /// notice a press the window itself never saw.
     #[cfg(target_os = "windows")]
     pointer_down: bool,
-    meter: Meter,
 }
 
 impl PetApp {
@@ -216,35 +174,17 @@ impl PetApp {
             }
         };
 
-        let pools = AnimPools::from_config(&config);
-        let clip_name = pools.pick_idle(None).ok_or_else(|| anyhow!("no idle animation available"))?;
-        let player = Player::new(clip_path(&asset_dir, &clip_name));
+        let core = PetCore::new(asset_dir, &config, options.stats)?;
 
         let last_pos = window.outer_position().unwrap_or_else(|_| requested.unwrap_or(PhysicalPosition::new(0, 0)));
         let now = Instant::now();
-        log::info!("window at {},{} ({}x{} physical), scale {ppp}, idle clip {clip_name}", last_pos.x, last_pos.y, CANVAS_W, CANVAS_H);
+        log::info!("window at {},{} ({}x{} physical), scale {ppp}, idle clip {}", last_pos.x, last_pos.y, CANVAS_W, CANVAS_H, core.clip_name());
         if options.stats && !cfg!(target_os = "linux") {
             log::warn!("--stats is only implemented on Linux");
         }
 
         Ok(Self {
-            asset_dir,
-            pools,
-            throw_power: config.throw_power(),
-            player,
-            clip_name,
-            mode: Mode::Idle,
-            clip_done: false,
-            failed_clips: 0,
-            stalled: false,
-            play_gen: 0,
-            texture: None,
-            texture_key: None,
-            next_due: None,
-            squash: None,
-            pending_squash: false,
-            press: None,
-            saw_button_down: false,
+            core,
             window,
             ppp,
             last_pos,
@@ -257,175 +197,23 @@ impl PetApp {
             passthrough: false,
             #[cfg(target_os = "windows")]
             pointer_down: false,
-            meter: Meter::new(options.stats),
         })
     }
 
-    /// Clip switch used for every transition.
-    fn play(&mut self, name: String, mode: Mode) {
-        self.play_gen += 1;
-        self.player = Player::new(clip_path(&self.asset_dir, &name));
-        self.clip_name = name;
-        self.mode = mode;
-        self.clip_done = false;
-        self.next_due = None;
-    }
-
-    fn play_idle(&mut self) {
-        match self.pools.pick_idle(Some(&self.clip_name)) {
-            Some(name) => {
-                log::debug!("-> idle {name}");
-                self.play(name, Mode::Idle);
-            }
-            None => {
-                log::error!("no idle animation available");
-                self.stalled = true;
-            }
-        }
-    }
-
-    fn play_drag(&mut self) {
-        self.squash = None;
-        self.pending_squash = false;
-        if let Some(name) = self.pools.pick_drag() {
-            log::debug!("-> drag {name}");
-            self.play(name, Mode::Drag);
-        }
-    }
-
-    fn play_click(&mut self) {
-        if let Some(name) = self.pools.pick_click() {
-            log::debug!("-> click {name}");
-            self.play(name, Mode::Click);
-            self.squash = None;
-            self.pending_squash = true;
-        }
-    }
-
-    /// Decoder ticks, clip-end handling and the squash start.
-    fn advance_clip(&mut self, ctx: &egui::Context, now: Instant) {
-        let before = self.player.seq();
-        self.next_due = self.player.advance(now);
-        let advanced = self.player.seq() != before;
-        if advanced && self.pending_squash {
-            // The squash runs over the new clip's first frame, as upstream does
-            // when the freshly loaded video becomes ready.
-            self.pending_squash = false;
-            self.squash = Some(now);
-            ctx.request_repaint();
-        }
-        if self.player.ended() && !self.clip_done {
-            self.on_clip_end();
-        }
-    }
-
-    fn on_clip_end(&mut self) {
-        self.clip_done = true;
-        let produced = self.player.seq() > 0;
-        if produced {
-            self.failed_clips = 0;
-        } else {
-            self.failed_clips += 1;
-            log::warn!("clip {} produced no frames", self.clip_name);
-            if self.failed_clips >= 3 {
-                log::error!("three clips in a row failed to decode; stopping playback");
-                self.stalled = true;
-                return;
-            }
-        }
-
-        // The web client keeps showing the drag pose while the pointer is still
-        // held, even if the (10 s) clip ended in the meantime.
-        if self.mode == Mode::Drag && self.press.is_some_and(|press| press.dragging) {
-            return;
-        }
-        self.play_idle();
-    }
-
-    /// Press, drag and release handling.
-    fn update_pointer(&mut self, ctx: &egui::Context) {
-        let (pressed, released, local) =
-            ctx.input(|input| (input.pointer.primary_pressed(), input.pointer.primary_released(), input.pointer.interact_pos()));
+    /// Assembles this frame's host state from egui's input and the platform's
+    /// global pointer read.
+    fn frame_input(&mut self, ctx: &egui::Context, now: Instant) -> FrameInput {
+        let (pressed, released, local, dt) =
+            ctx.input(|input| (input.pointer.primary_pressed(), input.pointer.primary_released(), input.pointer.interact_pos(), input.stable_dt));
 
         // See `fold_global_pointer`: on Windows the global read can supply both
         // the position and a press the window never saw.
         #[cfg(target_os = "windows")]
         let (pressed, local) = self.fold_global_pointer(pressed, local);
 
-        if pressed
-            && self.press.is_none()
-            && let Some(pos) = local
-        {
-            let canvas = pos.to_vec2() * self.ppp;
-            if HIT_BOX.contains(canvas.x, canvas.y) {
-                self.press =
-                    Some(Press { start: pos, off: canvas - Vec2::new(CANVAS_W as f32 / 2.0, CANVAS_H as f32 / 2.0), dragging: false, spring: None });
-                self.saw_button_down = false;
-            }
-        }
-
-        let Some(mut press) = self.press else {
-            self.set_cursor(ctx, local);
-            return;
-        };
-
-        let local = local.unwrap_or(press.start);
-        if !press.dragging && (local - press.start).length() >= DRAG_THRESHOLD {
-            press.dragging = true;
-            // The user took over the placement; stop re-applying the startup one.
-            self.target_pos = None;
-            let window_pos = self.window.outer_position().unwrap_or(self.last_pos);
-            press.spring = Some(Spring2::new(window_pos.x as f32, window_pos.y as f32));
-            self.play_drag();
-        }
-
-        let (gx, gy, down) = self.pointer_global(local);
-        if down == Some(true) {
-            self.saw_button_down = true;
-        }
-        if press.dragging {
-            self.step_drag(&mut press, gx, gy, ctx);
-        }
-        self.press = Some(press);
-
-        let pointer_up = matches!(down, Some(false)) && self.saw_button_down;
-        if released || pointer_up {
-            let press = self.press.take().expect("press was present");
-            self.saw_button_down = false;
-            if press.dragging {
-                log::debug!("drag released");
-                self.play_idle();
-            } else {
-                self.play_click();
-            }
-        }
-
-        self.set_cursor(ctx, Some(local));
-    }
-
-    fn set_cursor(&self, ctx: &egui::Context, local: Option<Pos2>) {
-        if self.press.is_some_and(|press| press.dragging) {
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if local.is_some_and(|pos| {
-            let canvas = pos.to_vec2() * self.ppp;
-            HIT_BOX.contains(canvas.x, canvas.y)
-        }) {
-            ctx.set_cursor_icon(egui::CursorIcon::Grab);
-        }
-    }
-
-    /// Integrates the drag spring and moves the native window with it.
-    fn step_drag(&mut self, press: &mut Press, gx: f32, gy: f32, ctx: &egui::Context) {
-        let Some(spring) = &mut press.spring else { return };
-        let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 1.0 / 30.0);
-        let target = (gx - press.off.x - CANVAS_W as f32 / 2.0, gy - press.off.y - CANVAS_H as f32 / 2.0);
-        spring.step(target, dt, self.throw_power);
-        let x = spring.x.round() as i32;
-        let y = spring.y.round() as i32;
-        if x != self.last_pos.x || y != self.last_pos.y {
-            self.window.set_outer_position(PhysicalPosition::new(x, y));
-            self.last_pos = PhysicalPosition::new(x, y);
-        }
+        let (global, button_down) = self.global_pointer();
+        let origin = self.window.outer_position().unwrap_or(self.last_pos);
+        FrameInput { now, dt, ppp: self.ppp, pointer: local, pressed, released, global, button_down, window_origin: (origin.x, origin.y) }
     }
 
     /// Global pointer position in physical pixels plus the left button state.
@@ -436,21 +224,19 @@ impl PetApp {
     /// Windows needs the same for the same reason, plus one of its own: the
     /// window follows the pointer during a drag, so `outer_position + local`
     /// lags behind the real cursor by the spring offset.
-    fn pointer_global(&self, local: Pos2) -> (f32, f32, Option<bool>) {
+    fn global_pointer(&self) -> (Option<(f32, f32)>, Option<bool>) {
         #[cfg(target_os = "linux")]
         if let Some(x11) = &self.x11 {
             match x11.pointer() {
-                Ok((x, y, down)) => return (x as f32, y as f32, Some(down)),
+                Ok((x, y, down)) => return (Some((x as f32, y as f32)), Some(down)),
                 Err(err) => log::debug!("query_pointer failed: {err}"),
             }
         }
         #[cfg(target_os = "windows")]
         if let Some((x, y, down)) = pet_win32::pointer() {
-            return (x as f32, y as f32, Some(down));
+            return (Some((x as f32, y as f32)), Some(down));
         }
-        let origin = self.window.outer_position().unwrap_or(self.last_pos);
-        let canvas = local.to_vec2() * self.ppp;
-        (origin.x as f32 + canvas.x, origin.y as f32 + canvas.y, None)
+        (None, None)
     }
 
     /// Windows only: fill in a press and position that egui never saw.
@@ -468,7 +254,7 @@ impl PetApp {
         let origin = self.window.outer_position().unwrap_or(self.last_pos);
         let canvas = Vec2::new((x - origin.x) as f32, (y - origin.y) as f32);
         let local = Some(Pos2::new(canvas.x / self.ppp, canvas.y / self.ppp));
-        (pressed || (rising && self.press.is_none()), local)
+        (pressed || (rising && !self.core.has_press()), local)
     }
 
     /// Windows only: keep the window interactive exactly while the pointer is
@@ -486,69 +272,11 @@ impl PetApp {
         // A press keeps the window interactive even after the pointer leaves the
         // hit box: winit installed the mouse capture on button-down, and a
         // click-through window would never see the release.
-        let passthrough = self.press.is_none() && !HIT_BOX.contains(canvas_x, canvas_y);
+        let passthrough = !self.core.has_press() && !HIT_BOX.contains(canvas_x, canvas_y);
         if passthrough != self.passthrough {
             log::debug!("passthrough {passthrough}");
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
             self.passthrough = passthrough;
-        }
-    }
-
-    /// Uploads the current frame when it changed and paints it at native size.
-    fn paint(&mut self, ui: &mut egui::Ui, now: Instant) {
-        let Some(frame) = self.player.current() else { return };
-        let key = (self.play_gen, self.player.seq());
-        if self.texture_key != Some(key) {
-            let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
-            match &mut self.texture {
-                Some(texture) if texture.size() == [frame.width, frame.height] => texture.set(image, TextureOptions::LINEAR),
-                _ => self.texture = Some(ui.ctx().load_texture("pet-frame", image, TextureOptions::LINEAR)),
-            }
-            self.texture_key = Some(key);
-        }
-        let Some(texture) = &self.texture else { return };
-
-        let scale = match self.squash {
-            Some(start) => squash_scale((now - start).as_secs_f32() / SQ_DURATION_SECS, SQ_SQUASH),
-            None => 1.0,
-        };
-        let ppp = self.ppp;
-        let width = CANVAS_W as f32 / ppp;
-        let height = CANVAS_H as f32 * scale / ppp;
-        // Anchored at the bottom edge, like `transform-origin: bottom` upstream.
-        let rect = Rect::from_min_size(Pos2::new(0.0, CANVAS_H as f32 / ppp - height), Vec2::new(width, height));
-        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
-    }
-
-    fn schedule_repaint(&mut self, ctx: &egui::Context, now: Instant) {
-        if let Some(start) = self.squash {
-            let elapsed = (now - start).as_secs_f32();
-            if elapsed >= SQ_DURATION_SECS {
-                self.squash = None;
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(8));
-            }
-        }
-        // Windows has to poll the global cursor to decide whether the window is
-        // click-through, and a click-through window receives no events that could
-        // wake the loop, so the poll has to be timed rather than event-driven.
-        #[cfg(target_os = "windows")]
-        ctx.request_repaint_after(Duration::from_millis(16));
-        if self.press.is_some_and(|press| press.dragging) {
-            ctx.request_repaint();
-            return;
-        }
-        if self.press.is_some() {
-            // Poll the button state so a release outside the window is still
-            // noticed even when no more window events arrive.
-            ctx.request_repaint_after(Duration::from_millis(8));
-            return;
-        }
-        if let Some(due) = self.next_due {
-            ctx.request_repaint_after(due);
-        } else if !self.stalled && !self.player.ended() {
-            ctx.request_repaint_after(Duration::from_millis(8));
         }
     }
 }
@@ -562,11 +290,6 @@ impl eframe::App for PetApp {
         let ctx = ui.ctx().clone();
         let now = Instant::now();
 
-        if ctx.input(|input| input.key_pressed(egui::Key::Q) && input.modifiers.command) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
         if now >= self.on_top_next && now < self.on_top_until {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
             // X11 only keeps a pre-map move if the window manager honours the
@@ -579,13 +302,24 @@ impl eframe::App for PetApp {
             self.on_top_next = now + Duration::from_millis(500);
         }
 
-        self.update_pointer(&ctx);
-        #[cfg(target_os = "windows")]
-        self.update_passthrough(&ctx);
-        self.advance_clip(&ctx, now);
-        self.paint(ui, now);
-        self.schedule_repaint(&ctx, now);
-        self.meter.tick(self.texture.as_ref().map_or(0, |texture| texture.byte_size()));
+        let input = self.frame_input(&ctx, now);
+        let out = self.core.ui(ui, input);
+        if let Some(pos) = out.move_to {
+            self.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
+            self.last_pos = PhysicalPosition::new(pos.0, pos.1);
+        }
+        if out.drag_started {
+            self.target_pos = None;
+        }
+        if let Some(cursor) = out.cursor {
+            ctx.set_cursor_icon(cursor);
+        }
+        if out.close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            #[cfg(target_os = "windows")]
+            self.update_passthrough(&ctx);
+        }
     }
 }
 
@@ -594,112 +328,9 @@ impl eframe::App for PetApp {
 /// coordinates are physical.
 fn place_window(window: &Window, position: &pet_config::Position) -> Option<PhysicalPosition<i32>> {
     let monitor = window.primary_monitor().or_else(|| window.current_monitor())?;
-    let ppp = window.scale_factor();
     let origin = monitor.position();
     let size = monitor.size();
-    let margin_x = (f64::from(position.margin_x) * ppp).round() as i32;
-    let margin_y = (f64::from(position.margin_y) * ppp).round() as i32;
-    let width = CANVAS_W as i32;
-    let height = CANVAS_H as i32;
-    let right = origin.x + size.width as i32 - width - margin_x;
-    let bottom = origin.y + size.height as i32 - height - margin_y;
-    let (x, y) = match position.corner.as_str() {
-        "top-left" => (origin.x + margin_x, origin.y + margin_y),
-        "bottom-left" => (origin.x + margin_x, bottom),
-        "bottom-right" => (right, bottom),
-        "top-right" => (right, origin.y + margin_y),
-        other => {
-            log::warn!("unknown corner {other:?}; using top-right");
-            (right, origin.y + margin_y)
-        }
-    };
+    let (x, y) = corner_position((origin.x, origin.y), (size.width, size.height), position, window.scale_factor());
     window.set_outer_position(PhysicalPosition::new(x, y));
     Some(PhysicalPosition::new(x, y))
-}
-
-// ---------------------------------------------------------------------------
-// Optional runtime meter (Linux only).
-
-#[cfg(target_os = "linux")]
-struct Meter {
-    enabled: bool,
-    start: Instant,
-    last: Instant,
-    frames: u64,
-    frames_last: u64,
-    last_cpu: (u64, u64),
-}
-
-#[cfg(target_os = "linux")]
-impl Meter {
-    fn new(enabled: bool) -> Self {
-        let now = Instant::now();
-        Self { enabled, start: now, last: now, frames: 0, frames_last: 0, last_cpu: cpu_ticks() }
-    }
-
-    fn tick(&mut self, texture_bytes: usize) {
-        if !self.enabled {
-            return;
-        }
-        self.frames += 1;
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last);
-        if elapsed < Duration::from_secs(1) {
-            return;
-        }
-        let fps = (self.frames - self.frames_last) as f64 / elapsed.as_secs_f64();
-        self.frames_last = self.frames;
-        self.last = now;
-        let ticks = cpu_ticks();
-        let used = (ticks.0 - self.last_cpu.0) + (ticks.1 - self.last_cpu.1);
-        self.last_cpu = ticks;
-        let cpu = used as f64 / 100.0 / elapsed.as_secs_f64() * 100.0;
-        let (rss, hwm) = rss_kb();
-        log::info!(
-            target: "whale-pet::stats",
-            "t={:.0}s fps={fps:.1} cpu={cpu:.1}% rss={:.1}MB hwm={:.1}MB tex={:.2}MB",
-            now.duration_since(self.start).as_secs_f64(),
-            rss as f64 / 1024.0,
-            hwm as f64 / 1024.0,
-            texture_bytes as f64 / (1024.0 * 1024.0),
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn cpu_ticks() -> (u64, u64) {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return (0, 0) };
-    let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest.trim()) else { return (0, 0) };
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let user = fields.get(11).and_then(|value| value.parse().ok()).unwrap_or(0);
-    let system = fields.get(12).and_then(|value| value.parse().ok()).unwrap_or(0);
-    (user, system)
-}
-
-#[cfg(target_os = "linux")]
-fn rss_kb() -> (u64, u64) {
-    let mut rss = 0;
-    let mut hwm = 0;
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(value) = line.strip_prefix("VmRSS:") {
-                rss = value.split_whitespace().next().and_then(|value| value.parse().ok()).unwrap_or(0);
-            } else if let Some(value) = line.strip_prefix("VmHWM:") {
-                hwm = value.split_whitespace().next().and_then(|value| value.parse().ok()).unwrap_or(0);
-            }
-        }
-    }
-    (rss, hwm)
-}
-
-#[cfg(not(target_os = "linux"))]
-struct Meter;
-
-#[cfg(not(target_os = "linux"))]
-impl Meter {
-    fn new(_enabled: bool) -> Self {
-        Self
-    }
-
-    fn tick(&mut self, _texture_bytes: usize) {}
 }

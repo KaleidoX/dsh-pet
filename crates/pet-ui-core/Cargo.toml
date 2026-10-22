@@ -1,0 +1,18 @@
+[package]
+name = "pet-ui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+egui.workspace = true
+log.workspace = true
+pet-config.workspace = true
+pet-decode.workspace = true
+pet-model.workspace = true
+
+[lints]
+workspace = true
