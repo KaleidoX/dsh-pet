@@ -1,6 +1,6 @@
 # whale-pet 🐳
 
-**whale-pet** 是基于 egui 的跨平台独立桌面桌宠：单窗口、640×360 原尺寸透明动画，支持待机、拖动与点击回应。角色是 **鲸鱼娘（Whale Girl）**——Q 版蓝发小女仆，头顶呆毛、耳侧鳍饰，身后拖着鲸鱼尾巴。
+**whale-pet** 是基于 egui 的跨平台独立桌面桌宠：单窗口、640×360 原尺寸透明动画，支持待机、拖动、甩抛、自主漫游、点击回应、悬浮提示与右键菜单。角色是 **鲸鱼娘（Whale Girl）**——Q 版蓝发小女仆，头顶呆毛、耳侧鳍饰，身后拖着鲸鱼尾巴。
 
 本仓库同时是 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 的衍生仓库，保留了上游插件源码与其素材，并额外提供 **Codex 桌面应用**的自定义桌宠包。
 
@@ -20,7 +20,12 @@ cargo xtask run                           # 构建并启动
 whale-pet [--asset-dir <DIR>] [--stats] [--force-x11 | --force-wayland]
 ```
 
-拖动可移动窗口，点击会有回应，`Ctrl+Q` 退出。素材根默认取仓库内的 `dsh-pet/assets`，也可以用 `--asset-dir` 或 `WHALE_PET_ASSET_DIR` 指定位置。Wayland 会话下默认走原生 layer shell，初始化失败会自动回退 XWayland。
+拖动可移动窗口，快速甩动会把宠物抛出去；点击命中框会被回应（飞行中点击还会弹出积分卡片），
+指针悬停显示名字，右键打开动作菜单。`Ctrl+Q` 退出。素材根默认取仓库内的 `dsh-pet/assets`，也可以用
+`--asset-dir` 或 `WHALE_PET_ASSET_DIR` 指定位置。Wayland 会话下默认走原生 layer shell，初始化失败会自动回退 XWayland。
+
+菜单、悬浮提示与积分卡片画在一个独立的透明浮层窗口里，主窗口始终保持正好 640×360 物理像素。
+本应用不接入 dsh：余额、碎碎念、对话、系统通知与工作状态联动都不包含在内。
 
 构建细节、平台实现限制与实测数据见 [`docs/whale-pet.md`](docs/whale-pet.md)。
 
