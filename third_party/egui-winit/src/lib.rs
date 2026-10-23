@@ -2454,7 +2454,9 @@ pub fn create_winit_window_attributes(
         }
 
         // don't request the undecorated-window drop shadow in fullscreen (#8399)
-        let want_undecorated_shadow = !decorations.unwrap_or(true) && !fullscreen.unwrap_or(false);
+        let want_undecorated_shadow = !decorations.unwrap_or(true)
+            && !fullscreen.unwrap_or(false)
+            && _has_shadow.unwrap_or(true);
         window_attributes = window_attributes.with_undecorated_shadow(want_undecorated_shadow);
     }
 

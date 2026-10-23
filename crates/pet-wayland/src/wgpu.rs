@@ -4,11 +4,7 @@
 //! wgpu has no safe constructor for a Wayland surface outside winit. The unsafe
 //! part lives in [`crate::ffi`]; this module only assembles the safe calls.
 //!
-//! Sizing contract with the rest of the crate: the swapchain is always
-//! `CANVAS_W × CANVAS_H` physical pixels. Fractional scaling is expressed with a
-//! `wp_viewport` destination rectangle set by `surface.rs` (protocol: buffer size
-//! = surface size × scale, and `wl_surface` buffer scale stays 1), so the canvas
-//! keeps its native pixel size at 1.0x, 1.5x and 2.0x alike.
+//! The swapchain covers the pet canvas and controls in one surface.
 
 use anyhow::{Context as _, Result, anyhow};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
@@ -20,20 +16,15 @@ use wgpu::{
 };
 
 /// Everything needed to turn egui's tessellated output into a frame.
-///
-/// One instance backs both of the app's surfaces (the pet and the interaction
-/// overlay): [`Self::sibling`] builds the second renderer on the same device and
-/// queue, so the two windows share a GPU context and always agree on format.
 pub(crate) struct Wgpu {
     /// Declared before `instance`: fields drop in declaration order, so the
     /// surface is torn down while the instance that created it is still alive.
     /// The raw `wl_surface`/`wl_display` it points into are owned by
     /// `WaylandApp`, which drops its `Wgpu` before both.
     surface: Surface<'static>,
-    /// Kept for [`Self::sibling`], which creates the second surface from it.
-    instance: Instance,
-    /// Kept for [`Self::sibling`]: capabilities must be asked of the adapter
-    /// the first surface was accepted by.
+    /// Retained until after the surface is destroyed.
+    _instance: Instance,
+    /// Adapter metadata used for startup diagnostics.
     adapter: Adapter,
     device: Device,
     queue: Queue,
@@ -64,16 +55,6 @@ impl Wgpu {
         Ok(wgpu)
     }
 
-    /// A renderer for a second surface, sharing this one's device and queue.
-    ///
-    /// The overlay window is a separate `wl_surface`; giving it the same device
-    /// avoids a second adapter request and guarantees the two swapchains use
-    /// one format and alpha mode.
-    pub(crate) fn sibling(&self, wl_surface: &WlSurface, size: (u32, u32)) -> Result<Self> {
-        let surface = create_surface(&self.instance, wl_surface)?;
-        Self::assemble(self.instance.clone(), surface, self.adapter.clone(), self.device.clone(), self.queue.clone(), size)
-    }
-
     fn assemble(instance: Instance, surface: Surface<'static>, adapter: Adapter, device: Device, queue: Queue, size: (u32, u32)) -> Result<Self> {
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -99,7 +80,7 @@ impl Wgpu {
         };
         surface.configure(&device, &config);
         let renderer = Renderer::new(&device, format, RendererOptions::default());
-        Ok(Self { surface, instance, adapter, device, queue, renderer, format, config })
+        Ok(Self { surface, _instance: instance, adapter, device, queue, renderer, format, config })
     }
 
     /// Reallocates the swapchain when the scale changes.

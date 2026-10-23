@@ -59,7 +59,7 @@ pub struct FrameInput {
     /// Window points to canvas pixels (`window.scale_factor()` under
     /// eframe/winit, the fractional output scale on Wayland).
     pub ppp: f32,
-    /// Pointer position in window-local points, if known.
+    /// Pointer position in canvas-local points, if known.
     pub pointer: Option<Pos2>,
     /// Left button went down this frame.
     pub pressed: bool,
@@ -72,7 +72,7 @@ pub struct FrameInput {
     pub global: Option<(f32, f32)>,
     /// Global left button state, when known.
     pub button_down: Option<bool>,
-    /// Window top-left in canvas pixels (physical screen coordinates).
+    /// Canvas top-left in physical screen coordinates.
     pub window_origin: (i32, i32),
     /// Monitor work area in physical pixels: the space the pet may roam in.
     pub world: WorldArea,
@@ -81,7 +81,7 @@ pub struct FrameInput {
 /// What the interaction overlay should show this frame.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum OverlayIntent {
-    /// Nothing: the overlay window may be hidden.
+    /// No controls to draw over the pet.
     #[default]
     Hidden,
     /// Hover tooltip anchored at a screen position in physical pixels.
@@ -311,9 +311,9 @@ impl PetCore {
         })
     }
 
-    /// Advances the decoder and paints the current frame. Must be called once
-    /// per frame from inside the host's egui pass.
-    pub fn ui(&mut self, ui: &mut egui::Ui, input: FrameInput) -> FrameOutput {
+    /// Advances input, motion and playback once per frame. The scene then places
+    /// the native window and calls `paint` with the resulting canvas offset.
+    pub fn update(&mut self, ui: &mut egui::Ui, input: FrameInput) -> FrameOutput {
         let mut out = FrameOutput::default();
 
         if ui.ctx().input(|state| state.key_pressed(egui::Key::Q) && state.modifiers.command) {
@@ -336,7 +336,6 @@ impl PetCore {
         self.update_pointer(&mut out, input);
         self.advance_clip(ui.ctx(), input.now);
         self.step_motion(&mut out, input.now);
-        self.paint(ui, input.now, input.ppp);
         self.schedule_repaint(ui.ctx(), input.now);
         self.emit_overlay(&mut out, input);
         self.meter.tick(self.texture.as_ref().map_or(0, |texture| texture.byte_size()));
@@ -535,7 +534,7 @@ impl PetCore {
 
     /// Decoder ticks, clip-end handling and squash starts.
     ///
-    /// Runs before [`Self::paint`] in [`Self::ui`]: a frame that arrives in the
+    /// Runs before [`Self::paint`] in [`Self::update`]: a frame that arrives in the
     /// same pass as the end of the clip is held by `pending_end` and painted
     /// first, so the last frame is actually on screen before the switch.
     fn advance_clip(&mut self, ctx: &egui::Context, now: Instant) {
@@ -879,7 +878,8 @@ impl PetCore {
     // Painting.
 
     /// Uploads the current frame when it changed and paints it at native size.
-    fn paint(&mut self, ui: &mut egui::Ui, now: Instant, ppp: f32) {
+    /// Paints the canvas at an explicit offset in the shared window's points.
+    pub fn paint(&mut self, ui: &mut egui::Ui, now: Instant, ppp: f32, canvas_offset: Vec2) {
         if let Some(frame) = self.player.current() {
             if let Some(since) = self.hold_since.take() {
                 log::debug!("{} produced its first frame after {:.0} ms", self.clip_name, (now - since).as_secs_f32() * 1000.0);
@@ -907,7 +907,7 @@ impl PetCore {
         let width = CANVAS_W as f32 / ppp;
         let height = CANVAS_H as f32 * scale / ppp;
         let bottom = (CANVAS_H as f32 - lift) / ppp;
-        let rect = Rect::from_min_size(Pos2::new(0.0, bottom - height), Vec2::new(width, height));
+        let rect = Rect::from_min_size(Pos2::new(0.0, bottom - height) + canvas_offset, Vec2::new(width, height));
 
         // Mirror about the vertical centre for a right-facing pet.
         let uv = if self.facing.is_right() {

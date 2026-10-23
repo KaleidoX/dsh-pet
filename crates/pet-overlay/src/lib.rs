@@ -1,52 +1,17 @@
-//! Interaction overlay: tooltip, click-score burst and the context menu.
-//!
-//! The overlay is drawn in its own transparent, always-on-top window so the pet
-//! window can stay exactly 640x360 physical pixels. It has three modes:
-//!
-//! - [`OverlayMode::Hidden`] — nothing on screen; hosts hide the window.
-//! - [`OverlayMode::Transient`] — tooltip and/or score popup. The whole window
-//!   is click-through; it only paints.
-//! - [`OverlayMode::Menu`] — the context menu is open. The window takes the
-//!   pointer for as long as it is.
-//!
-//! # Layout
-//!
-//! The overlay window is [`OVERLAY_W`] x [`OVERLAY_H`] logical points, centred
-//! on the pet window. Everything inside is laid out in logical points using the
-//! upstream CSS numbers, so the menu, tooltip and score card keep their relative
-//! proportions regardless of the display scale.
-//!
-//! # Anchor convention
-//!
-//! - [`OverlayIntent::Tooltip`], [`OverlayIntent::Menu`] and
-//!   [`OverlayState::apply_score`] anchors are physical screen pixels (the
-//!   global cursor position), exactly like the upstream `position:fixed` DOM.
-//! - The overlay window follows the pet, but its real position is whatever the
-//!   host reports each frame: a window manager clamps a window that would hang
-//!   off the screen edge, so the requested position cannot be assumed.
-//! - [`OverlayState::ui`] therefore converts every stored screen anchor against
-//!   the window origin it is given for that frame, and only the drawing code
-//!   sees overlay points.
-//!
-//! # Ownership
-//!
-//! Hosts own the window; this crate owns the state and the drawing. Because
-//! eframe's deferred-viewport callback must be `Send + Sync + 'static`, hosts
-//! hold the state in an `Arc<Mutex<OverlayState>>` and hand the callback a clone.
-//!
-//! The mode is derived in [`OverlayState::tick`], which the host calls every
-//! frame on the pet's own pass. It is deliberately *not* derived inside the
-//! drawing callback: eframe runs no egui pass for a hidden child viewport, so a
-//! mode computed there could never change back from `Hidden`.
+//! Tooltip, score and menu drawn over the pet in the same native window.
+//! Hosts own one window and one egui context; PetScene composes both layers.
+//! Anchors use physical screen coordinates, controls use logical points.
 
 mod font;
+mod scene;
+pub use scene::{PetScene, SceneLayout};
 mod menu;
 mod score;
 mod tooltip;
 
 use std::time::Instant;
 
-use egui::{Pos2, Rect, Vec2};
+use egui::{Pos2, Rect};
 use pet_config::{PetConfig, WorldArea};
 use pet_ui_core::{OverlayAction, OverlayIntent, ScoreEvent};
 
@@ -55,22 +20,22 @@ pub use menu::{MenuItem, MenuNode, build_menu_tree};
 pub use score::{SCORE_POPUP_CSS_DURATION, SCORE_POPUP_SECS};
 pub use tooltip::tooltip_placement;
 
-/// Width of the overlay window in logical points. The pet window is
+/// Minimum width of the shared window in logical points. The pet canvas is
 /// `CANVAS_W / ppp` points wide, so this leaves room for a full three-level
 /// menu cascade on either side.
 pub const OVERLAY_W: f32 = 760.0;
-/// Height of the overlay window in logical points.
+/// Height of the shared window in logical points.
 pub const OVERLAY_H: f32 = 480.0;
 
 /// What the overlay currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayMode {
-    /// Nothing: the host may hide the window.
+    /// No controls to draw; the pet remains visible.
     #[default]
     Hidden,
-    /// Tooltip and/or score popup only; the window is click-through.
+    /// Tooltip and/or score popup only; controls do not take input.
     Transient,
-    /// The context menu is open; the window takes the pointer.
+    /// The context menu is open; menu input takes priority over pet input.
     Menu,
 }
 
@@ -89,7 +54,7 @@ pub struct OverlayState {
     world: Option<WorldArea>,
     /// Scale of the last frame, for converting screen pixels into points.
     ppp: f32,
-    /// Where the overlay window actually is, from the host; see
+    /// Where the shared window actually is, from the host; see
     /// [`Self::set_window_origin`].
     window_origin: (i32, i32),
     /// What the host knows about the pointer for the frame being drawn.
@@ -136,25 +101,13 @@ impl OverlayState {
         self.mode
     }
 
-    /// Whether the overlay is showing anything, so the host should keep the
-    /// window visible and ask for repaints.
-    pub fn visible(&self) -> bool {
-        self.mode != OverlayMode::Hidden
-    }
-
     /// Actions chosen in the overlay since the last call.
     pub fn take_actions(&mut self) -> Vec<OverlayAction> {
         std::mem::take(&mut self.actions)
     }
 
-    /// Whether an action is waiting for the pet's pass (the host keeps the pet
-    /// window awake so the action is not left pending).
-    pub fn has_actions(&self) -> bool {
-        !self.actions.is_empty()
-    }
-
     /// Expires the popups and derives the mode. Must run once per frame from
-    /// the pet's pass, whether or not the overlay window is shown.
+    /// the pet's pass, whether or not the shared window is shown.
     pub fn tick(&mut self, now: Instant) {
         if self.score.as_ref().is_some_and(|score| !score.alive(now) && !score.animating(now)) {
             self.score = None;
@@ -169,7 +122,7 @@ impl OverlayState {
     }
 
     /// Reports the work area the pet may roam in, in physical screen pixels, so
-    /// the menu can stay fully on screen when the overlay window itself hangs
+    /// the menu can stay fully on screen when the shared window itself hangs
     /// over the screen edge.
     ///
     /// Called every frame by the host, before [`Self::set_window_origin`] and
@@ -181,7 +134,7 @@ impl OverlayState {
         }
     }
 
-    /// Reports where the overlay window actually ended up on screen, in
+    /// Reports where the shared window actually ended up on screen, in
     /// physical pixels.
     ///
     /// The host asks for the window to be centred on the pet, but a window
@@ -260,7 +213,7 @@ impl OverlayState {
 
         let screen = ui.max_rect();
         let mut busy = false;
-        // Anchors are screen positions; the overlay window moves with the pet
+        // Anchors are screen positions; the shared window moves with the pet
         // and may be clamped by the window manager, so they are converted
         // against the window's real origin every frame.
         let (window_origin, ppp) = (self.window_origin, self.ppp);
@@ -314,27 +267,10 @@ impl OverlayState {
     }
 }
 
-/// Screen position of the overlay window for a pet window at `pet_origin`
-/// (physical pixels) and scale `ppp`.
-///
-/// The overlay is larger than the pet and centred on it, so its origin sits up
-/// and to the left of the pet window's.
-pub fn overlay_origin(pet_origin: (i32, i32), ppp: f32) -> (i32, i32) {
-    let pad_x = ((OVERLAY_W * ppp - pet_config::CANVAS_W as f32) / 2.0).round() as i32;
-    let pad_y = ((OVERLAY_H * ppp - pet_config::CANVAS_H as f32) / 2.0).round() as i32;
-    (pet_origin.0 - pad_x, pet_origin.1 - pad_y)
-}
-
 /// Pointer data the host passes in for a pass.
 ///
-/// The overlay is a window of its own. Before it has been placed, XInput2 can
-/// deliver a motion event measured from the screen origin instead of from the
-/// window, and egui keeps that number as the latest position for every later
-/// pass, so hover and hit tests would run on a point nowhere near the cursor.
-/// A host that can ask the display server for the real cursor position passes
-/// it here, in physical screen pixels — the same space as the anchors. Press
-/// and Escape edges are still read from the window's own input: only the
-/// position can be stale.
+/// Hosts that can read the desktop cursor supply physical screen coordinates.
+/// Press and Escape edges still come from the shared window's egui input.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OverlayInput {
     /// Global cursor in physical screen pixels, when the host can read it.
@@ -356,10 +292,4 @@ pub fn overlay_bounds(world: WorldArea, window_origin: (i32, i32), ppp: f32) -> 
     let min = screen_to_overlay((world.x as f32, world.y as f32), window_origin, ppp);
     let max = screen_to_overlay((world.right() as f32, world.bottom() as f32), window_origin, ppp);
     Rect::from_min_max(Pos2::new(min.0, min.1), Pos2::new(max.0, max.1))
-}
-
-/// Origin and size of the overlay window in points, for the viewport builder.
-pub fn overlay_placement(pet_origin: (i32, i32), ppp: f32) -> (Pos2, Vec2) {
-    let (x, y) = overlay_origin(pet_origin, ppp);
-    (Pos2::new(x as f32 / ppp, y as f32 / ppp), Vec2::new(OVERLAY_W, OVERLAY_H))
 }

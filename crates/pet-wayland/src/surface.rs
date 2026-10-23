@@ -12,7 +12,8 @@
 //! and latched by the next `wl_surface.commit` (the one `Queue::present` issues).
 
 use anyhow::Result;
-use pet_config::{CANVAS_H, CANVAS_W, HIT_BOX, Position};
+use pet_config::{CANVAS_H, CANVAS_W, Position};
+use pet_overlay::SceneLayout;
 use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{Anchor, LayerSurface};
@@ -38,15 +39,6 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
-    /// Pins the surface to the output's top-left corner.
-    ///
-    /// Used by the overlay window, whose position is always computed rather than
-    /// configured: with only `TOP | LEFT` anchored, [`Self::set_local_origin`]
-    /// writes exactly the two margins that place it.
-    pub(crate) fn top_left() -> Self {
-        Self { anchor: Anchor::TOP | Anchor::LEFT, left: 0, right: 0, top: 0, bottom: 0 }
-    }
-
     /// The corner and margins from the config file.
     ///
     /// Exactly one horizontal and one vertical edge is anchored per corner, so
@@ -83,9 +75,17 @@ impl Placement {
 
     /// Pushes the anchor and margins to the protocol object. They are latched by
     /// the next commit.
-    pub(crate) fn apply(&self, layer: &LayerSurface) {
+    pub(crate) fn apply_canvas(&self, layer: &LayerSurface, layout: SceneLayout) {
+        let offset = layout.offset_points();
+        let far_x = (layout.size.0 as f32 - CANVAS_W as f32) / layout.ppp - offset.x;
+        let far_y = (layout.size.1 as f32 - CANVAS_H as f32) / layout.ppp - offset.y;
         layer.set_anchor(self.anchor);
-        layer.set_margin(self.top, self.right, self.bottom, self.left);
+        layer.set_margin(
+            self.top - offset.y.round() as i32,
+            self.right - far_x.round() as i32,
+            self.bottom - far_y.round() as i32,
+            self.left - offset.x.round() as i32,
+        );
     }
 
     /// Top-left corner inside the output, in output-logical pixels.
@@ -95,18 +95,11 @@ impl Placement {
         (x, y)
     }
 
-    /// Moves the surface so its top-left lands on `origin` (output-logical
-    /// pixels), clamped to the output.
-    ///
-    /// Clamping happens here rather than being left to the compositor so that
-    /// [`Self::local_origin`] keeps reporting where the surface really is; the
-    /// drag spring feeds on that value and would otherwise chase a position the
-    /// compositor refused to apply.
+    /// Stores the canvas origin in output-logical pixels. SceneLayout constrains
+    /// the native window; clamping the canvas here would apply a second, different
+    /// limit after the scene has already painted its offset.
     pub(crate) fn set_local_origin(&mut self, origin: (f32, f32), output: (i32, i32), window: (u32, u32)) {
-        let max_x = (output.0 - window.0 as i32).max(0) as f32;
-        let max_y = (output.1 - window.1 as i32).max(0) as f32;
-        let x = origin.0.clamp(0.0, max_x);
-        let y = origin.1.clamp(0.0, max_y);
+        let (x, y) = origin;
 
         if self.anchor.contains(Anchor::RIGHT) {
             self.right = (output.0 as f32 - window.0 as f32 - x).round() as i32;
@@ -121,36 +114,19 @@ impl Placement {
     }
 }
 
-/// Restricts pointer input to the pet's hit box, so clicks anywhere else on the
-/// transparent canvas reach whatever is underneath.
-///
-/// Callers commit: the region is double-buffered like every other surface state.
-pub(crate) fn set_hit_region(compositor: &CompositorState, layer: &LayerSurface, ppp: f32) -> Result<()> {
-    let region = Region::new(compositor)?;
-    let x0 = (HIT_BOX.x0 as f32 / ppp).round() as i32;
-    let y0 = (HIT_BOX.y0 as f32 / ppp).round() as i32;
-    let x1 = (HIT_BOX.x1 as f32 / ppp).round() as i32;
-    let y1 = (HIT_BOX.y1 as f32 / ppp).round() as i32;
-    region.add(x0, y0, (x1 - x0).max(1), (y1 - y0).max(1));
-    layer.set_input_region(Some(region.wl_region()));
-    Ok(())
+/// Native surface extent in logical points, including room for controls.
+pub(crate) fn window_size(ppp: f32) -> (u32, u32) {
+    let size = SceneLayout::new(ppp).size_points();
+    (size.x.round() as u32, size.y.round() as u32)
 }
 
-/// Sets the overlay surface's input region: empty while it is click-through, or
-/// the whole surface while the menu is open.
-///
-/// An empty region is the protocol's way of saying "no input at all" — a null
-/// region would mean the opposite (infinite), so one is always created and left
-/// empty in the click-through case. The surface keeps being drawn, which is
-/// what the tooltip and the score card need. The overlay is a separate surface
-/// from the pet, so this never affects the pet's own hit box.
-///
-/// Callers commit: the region is double-buffered.
-pub(crate) fn set_overlay_region(compositor: &CompositorState, layer: &LayerSurface, size: (u32, u32), interactive: bool) -> Result<()> {
+/// Pet hit box when idle, full local window while a menu can be dismissed.
+pub(crate) fn set_input_region(compositor: &CompositorState, layer: &LayerSurface, layout: SceneLayout, menu: bool) -> Result<()> {
     let region = Region::new(compositor)?;
-    if interactive {
-        region.add(0, 0, size.0.max(1) as i32, size.1.max(1) as i32);
-    }
+    let rect = if menu { egui::Rect::from_min_size(egui::Pos2::ZERO, layout.size_points()) } else { layout.hit_rect() };
+    let x = rect.min.x.floor() as i32;
+    let y = rect.min.y.floor() as i32;
+    region.add(x, y, rect.max.x.ceil() as i32 - x, rect.max.y.ceil() as i32 - y);
     layer.set_input_region(Some(region.wl_region()));
     Ok(())
 }

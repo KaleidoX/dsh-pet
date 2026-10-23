@@ -32,9 +32,8 @@ const LINE_HEIGHT_POINTS: f32 = 40.0;
 /// for a fast click. They are translated in order, so egui sees the same
 /// sequence the compositor sent.
 ///
-/// Scroll (`Axis`) is only translated when `scroll` is set: the pet's own pass
-/// has no scrollable content, and the menu's scroll wheel belongs to the
-/// overlay's pass. The sign is flipped because Wayland reports how far the
+/// Scroll (`Axis`) is translated when `scroll` is set for the shared scene.
+/// The sign is flipped because Wayland reports how far the
 /// content moves, while winit (and therefore eframe, the reference host)
 /// reports the inverse and egui follows winit.
 pub(crate) fn translate_frame(events: &[PointerEvent], modifiers: Modifiers, down: &mut bool, scroll: bool, out: &mut Vec<Event>) {

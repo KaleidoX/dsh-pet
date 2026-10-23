@@ -21,9 +21,8 @@
 //!
 //! Coordinate spaces, matching `pet-ui-core`'s contract:
 //!
-//! - The layer surface is sized in output-logical pixels: `640/ppp × 360/ppp`.
-//!   That rectangle is handed to egui as `screen_rect`, with
-//!   `pixels_per_point = ppp`, so the canvas is always 640×360 physical pixels.
+//! - The layer surface includes room for controls. PetScene offsets its fixed
+//!   640×360 physical canvas inside that rectangle; egui uses logical points.
 //! - `FrameInput::global` and `FrameOutput::move_to` are canvas (= physical)
 //!   pixels; `surface.rs` converts them to margins when the window is dragged.
 //!
@@ -37,8 +36,6 @@ mod app;
 mod ffi;
 #[cfg(target_os = "linux")]
 mod input;
-#[cfg(target_os = "linux")]
-mod overlay;
 #[cfg(target_os = "linux")]
 mod surface;
 #[cfg(target_os = "linux")]

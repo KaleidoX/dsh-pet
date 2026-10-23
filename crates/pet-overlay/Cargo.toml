@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Interaction overlay (tooltip, score popup, context menu) drawn in a separate window"
+description = "Pet and interaction controls composed in one native window"
 
 [dependencies]
 egui.workspace = true

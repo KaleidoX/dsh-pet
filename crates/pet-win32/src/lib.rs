@@ -9,9 +9,8 @@
 //! only honoured for windows owned by the same thread, so it cannot hand a
 //! click to another process.
 //!
-//! Besides the pointer read this crate exposes two window helpers: turning off
-//! DWM's non-client rendering, and reading the work area of the monitor a
-//! window is on (the space the pet may roam in and the menu is clamped to).
+//! Window helpers disable DWM's non-client rendering, read the monitor's work
+//! area, and support the shared pet-and-controls window.
 //!
 //! This crate is the only place allowed to call Win32 directly: it does not
 //! inherit the workspace's `unsafe_code = "forbid"`.

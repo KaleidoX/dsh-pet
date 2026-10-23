@@ -10,7 +10,7 @@
 //!   events reach the window.
 
 use anyhow::{Context as _, Result, bail};
-use pet_config::HIT_BOX;
+use pet_overlay::SceneLayout;
 use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use winit::window::Window;
 use x11rb::connection::Connection as _;
@@ -22,6 +22,7 @@ pub(crate) struct X11 {
     conn: RustConnection,
     root: u32,
     window: u32,
+    input_region: Option<Rectangle>,
 }
 
 impl X11 {
@@ -35,16 +36,30 @@ impl X11 {
         };
         let (conn, screen) = x11rb::connect(None).context("connect to the X server")?;
         let root = conn.setup().roots[screen].root;
-        Ok(Self { conn, root, window: id })
+        Ok(Self { conn, root, window: id, input_region: None })
     }
 
     /// Restricts pointer input to the pet's hit box.
-    pub(crate) fn set_input_region(&self) -> Result<()> {
-        let rect = Rectangle { x: HIT_BOX.x0 as i16, y: HIT_BOX.y0 as i16, width: HIT_BOX.width() as u16, height: HIT_BOX.height() as u16 };
+    pub(crate) fn set_input_region(&mut self, layout: SceneLayout, menu: bool) -> Result<()> {
+        let hit = layout.hit_rect();
+        let rect = if menu {
+            Rectangle { x: 0, y: 0, width: layout.size.0 as u16, height: layout.size.1 as u16 }
+        } else {
+            Rectangle {
+                x: (hit.min.x * layout.ppp).round() as i16,
+                y: (hit.min.y * layout.ppp).round() as i16,
+                width: (hit.width() * layout.ppp).round() as u16,
+                height: (hit.height() * layout.ppp).round() as u16,
+            }
+        };
+        if self.input_region.is_some_and(|old| (old.x, old.y, old.width, old.height) == (rect.x, rect.y, rect.width, rect.height)) {
+            return Ok(());
+        }
         self.conn
             .shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, self.window, 0, 0, &[rect])?
             .check()
             .context("set the input region")?;
+        self.input_region = Some(rect);
         Ok(())
     }
 

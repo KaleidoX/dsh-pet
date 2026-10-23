@@ -11,9 +11,9 @@
 | `crates/pet-model` | 纯逻辑：随机链（`rollKind`）、分类权重、动画池、漫游规划、甩抛物理、释放速度估计、落地压缩、点击得分、拖动弹簧、Q 弹曲线；姿态描述子与切换代价（`describe_frame` / `pose_cost` / `pick_entry`） |
 | `crates/pet-decode` | `ffmpeg-next` 流式解码 VP9-alpha WebM，按 PTS 交付 RGBA 帧，并上报容器时长；`starting_at` 从指定帧开始播放，`decode_all` 供离线工具整段遍历 |
 | `crates/pet-ui-core` | 与窗口系统无关的行为：动画链、解码推进、弹簧拖动、甩抛、漫游、Q 弹、命中测试、点击积分、菜单动作、浮层意图、姿态匹配的关键帧硬切、重绘节奏、`--stats` 计量 |
-| `crates/pet-overlay` | 交互浮层的状态与绘制：悬浮提示、积分粒子与卡片、级联右键菜单；只依赖 egui，不依赖具体窗口系统 |
-| `crates/pet-ui-egui` | eframe 宿主：主窗口与浮层子视口、egui 事件循环、平台集成（X11 / Windows） |
-| `crates/pet-wayland` | 原生 Wayland 宿主：主 layer surface、浮层 layer surface（`Layer::Overlay`）、`wgpu`、`egui-wgpu`、`calloop`（仅 Linux） |
+| `crates/pet-overlay` | 共享单窗口场景、画布布局与交互控件：悬浮提示、积分粒子与卡片、级联右键菜单；不依赖具体窗口系统 |
+| `crates/pet-ui-egui` | eframe 宿主：宠物与控件共用一个主窗口、egui 事件循环、平台集成（X11 / Windows） |
+| `crates/pet-wayland` | 原生 Wayland 宿主：宠物与控件共用一个 layer surface、`wgpu`、`egui-wgpu`、`calloop`（仅 Linux） |
 | `crates/pet-win32` | Windows 全局指针读取、工作区查询与 DWM 边框关闭；唯一直接调用 Win32 的 crate |
 | `apps/whale-pet` | 二进制入口：参数解析、素材定位、宿主选择 |
 | `tools/anim-meta` | 离线姿态元数据生成器：解码全部 WebM，写 `assets/anim-meta.json`（不进 `default-members`） |
@@ -175,6 +175,7 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 问题只在原生 Wayland 上暴露（实测见 7.5）。
 弹道用工作区矩形做边界：左右各允许 200 画布像素的外伸（`SIDE_ALLOW`，身体贴边），
 下边界为工作区底边，撞墙按 `restitution` 反弹、着地按 `groundFriction` 减速，静止后提交位置并回随机链。
+甩抛以真实经过时间累计固定 120 Hz 物理步进，显示位置在相邻物理状态之间插值；单次恢复最多累计 250 ms。
 着地那一帧按落地前的竖直速度触发压缩（`landingSquash`，越快压得越深）。
 
 自主漫游按 `animations.moves` 选一个动作，用其 `minDist` / `maxDist` / `margin` 规划落点（朝当前面向方向走），
@@ -183,15 +184,14 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 
 ### 4.4 交互浮层
 
-主窗口恒为 640×360 物理像素，菜单、提示和积分卡片放不下，因此单独开一个 760×480 逻辑点的透明置顶浮层窗口，
-每帧跟随主窗口位置（`overlay_origin`：以宠物为中心，向上、向左各扩出 `(760·ppp−640)/2` 与 `(480·ppp−360)/2`）。
+宠物与菜单、提示、积分卡片共用一个透明窗口，画布保持 640×360 物理像素，窗口至少为 760×480 逻辑点。
+`PetScene` 统一更新核心状态、计算画布偏移并依次绘制宠物和控件；`SceneLayout` 将外层窗口限制在工作区内，
+同时保持画布的目标屏幕位置。各宿主不再创建独立 overlay 窗口或 surface。
 
-- **三种模式**：`Hidden`（什么都不显示，浮层窗口隐藏或提交一帧空白）、`Transient`（提示/积分，整窗点击穿透）、
-  `Menu`（菜单打开，整窗接收指针）。模式由 `OverlayState::tick` 在宠物的 pass 里推导，而不是在浮层的绘制回调里——
-  eframe 对隐藏的子视口根本不跑 egui pass，在那里推导会永远停留在 `Hidden`。
-- **坐标约定**：提示、菜单和积分卡片的锚点都是物理屏幕像素（与上游 `position:fixed` 一致）；
-  浮层窗口的真实位置由宿主每帧上报（窗口管理器可能因贴边而挪动它），绘制时按该原点换算成浮层逻辑点。
-  指针优先使用浮层自己收到的位置；Wayland 上浮层没有指针（穿透时不产生事件）时用宿主给出的屏幕坐标。
+- **三种模式**：`Hidden` 不绘制控件，`Transient` 绘制提示或积分，`Menu` 绘制菜单并让整窗接收指针；
+  其余模式仅宠物命中区接收输入。菜单期间核心不处理按键边沿，防止菜单点击触发宠物动作。
+- **坐标约定**：控件锚点使用物理屏幕坐标，绘制时换算成窗口逻辑点；核心输入则使用画布局部坐标。
+  靠近边缘时画布偏移会变化，命中区随之更新，不能假定画布一直居中。
 - **悬浮提示**：白底圆角、`#1f1f1f` 文字、单行省略；默认在指针右下，越界翻到左上，最后夹进浮层窗口。
   字号取自 `font.size`（`Font::tooltip_size`）。
 - **点击积分**：按下时若宠物正在飞行且速度超过阈值，得分为速度（462 基准）/100，弹出 20 个粒子和一张 `+N` 卡片
@@ -206,8 +206,8 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 
 ### 4.5 重绘调度
 
-按需重绘：解码下一帧到期时间；拖动中每帧重绘；甩抛、漫游与 Q 弹期间每 8 ms 一次；
-按住未拖动时每 8 ms 轮询一次以便窗口外的释放也能被处理；浮层由宿主在可见时每帧重绘并跟随宠物；
+按需重绘：解码下一帧到期时间；拖动、甩抛和漫游请求下一帧重绘；Q 弹期间每 8 ms 一次；
+按住未拖动时每 8 ms 轮询一次以便窗口外的释放也能被处理；可见控件与宠物在同一绘制周期更新；
 Windows 额外固定每 16 ms 轮询全局指针（见 5.3）。
 
 ## 5. 平台实现
@@ -217,18 +217,17 @@ Windows 额外固定每 16 ms 轮询全局指针（见 5.3）。
 `crates/pet-wayland` 用 `zwlr_layer_shell_v1` 建窗口。这条路径同时解决了 X11 节里那三个硬需求，且不依赖
 XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上，`wl_surface.set_input_region()` 提供按区域穿透。
 
-- **坐标**：交换链固定 640×360 物理像素；surface 尺寸是输出逻辑像素 `round(640/ppp) × round(360/ppp)`
-  （1.5 倍下为 427×240），由 `wp_viewport.set_destination` 把缓冲拉伸到该矩形，`buffer_scale` 保持 1。
-  egui 以这个逻辑矩形为 `screen_rect`、`pixels_per_point = ppp`，因此 `PetCore` 在两条路径上看到相同的输入形状。
-  `FrameInput.global` / `window_origin` / `FrameOutput.move_to` 用画布像素，宿主负责与逻辑坐标互换。
+- **坐标**：交换链包含画布与控件，尺寸由 `SceneLayout` 按缩放计算；`wp_viewport.set_destination`
+  将缓冲映射到窗口逻辑尺寸，`buffer_scale` 保持 1。画布仍保持 640×360 物理像素。
+  场景负责原生窗口坐标与画布坐标转换，宿主负责物理像素与输出逻辑坐标转换。
 - **缩放**：`wp_fractional_scale_manager_v1` 的 `preferred_scale`（KWin 给 180）除以 120 得到 `ppp`；
   `set_size` + `set_destination` + `set_input_region` 一起重新下发。没有该全局时退回 `wl_output.scale_factor`，
   KWin 只报整数 2，画布会偏大但可用。整数缩放事件不会覆盖已经收到的分数缩放值。
 - **定位**：`corner` 直接映射成 `Anchor`，`marginX` / `marginY` 本来就是逻辑像素，原样作为 margin。
   拖动时反向算：`move_to / ppp` 减去输出的 `logical_position` 得到输出内逻辑坐标，再按当前 anchor 换成两个 margin；
-  每帧最多一次，且被 clamp 在输出矩形内，避免弹簧追一个合成器拒绝执行的位置。
+  外层窗口由共享布局限位，宿主不再对画布重复限位，以免 margin 与已经绘制的偏移不一致。
 - **输出**：以 `wl_surface.enter` 为准——它指出合成器实际把 surface 放在哪个输出上，其 `logical_position` /
-  `logical_size` 供全局坐标换算与拖动 clamp 使用。只有在该事件始终没来时，才退回「第一个报告逻辑尺寸的输出」。
+  `logical_size` 供全局坐标换算与共享布局使用。只有在该事件始终没来时，才退回「第一个报告逻辑尺寸的输出」。
 - **穿透**：`set_input_region` 限制为 `HIT_BOX`（按 `ppp` 换算），命中框外的点击落到下层窗口。
 - **拖动**：不锁指针。窗口跟随指针时指针仍在 surface 内，`wl_pointer` 的隐式抓取足够；全局位置只在收到指针事件时
   按当时的窗口原点换算并缓存——Wayland 不会因为窗口自己移动而补发 motion，每帧重算会形成反馈。释放速度的轨迹
@@ -238,17 +237,9 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
 - **渲染**：wgpu 30.0.1 的 Vulkan 后端；优先 `Bgra8Unorm` + `PreMultiplied` alpha。`Queue::present` 在 Wayland 上
   attach + commit 一次完成，所以 viewport destination、margin、input region 都必须在 present 之前设置。
 - **重绘**：`FullOutput.viewport_output[ROOT].repaint_delay` 决定下一次唤醒，`Duration::MAX` 时用 1 秒心跳兜底。
-- **交互浮层**：同一连接上再建一个 `Layer::Overlay` 的 layer surface（`OVERLAY_W × OVERLAY_H` 逻辑点，
-  `set_exclusive_zone(-1)`），共享 `Wgpu` 的 device/queue（`Wgpu::sibling`），拥有独立的 `egui::Context` 与 `Wgpu`。
-  位置固定 `Anchor::TOP | Anchor::LEFT`，每帧按主窗口位置换算成 margin，与帧一起提交。输入区随模式切换：
-  `Hidden` / `Transient` 传空 region（点击穿透），`Menu` 传整窗；空 region 必须显式创建，`None` 表示无限输入区。
-  它在合成器报告出宠物所在输出之后才创建；输出变化时（`belongs_to` 不匹配）销毁重建。创建失败只降级为
-  「没有浮层」，宠物本身继续工作。
-- **浮层键盘**：浮层用 `KeyboardInteractivity::None`，不抢焦点；Esc 由宠物的 `wl_keyboard` 收到后转发给浮层的
-  输入队列，因此 `Ctrl+Q` 也不会被浮层截走。
-- **指针归属**：一个 `wl_pointer` 报告它进入的每个 surface，`pointer_frame` 按 `event.surface` 把同一帧拆给宠物和
-  浮层；浮层的位置是相对它自己的 surface 的。浮层移动时不补发 motion，所以宿主在移动 surface 时对缓存的位置做
-  反向补偿；输入区从空变为整窗后合成器也不立刻补发 `enter`，切换时清空缓存，改用宿主给出的屏幕坐标定位首帧。
+- **交互控件**：与宠物共享 layer surface、egui context 和 GPU 渲染器。菜单打开时输入区为整窗，
+  关闭后恢复带画布偏移的命中区；相同输入区不重复下发。Esc 直接进入同一 egui 输入队列。
+- **指针归属**：只处理当前宠物 surface 的事件；离开时清理悬停指针，拖动期间保留释放所需的位置。
 
 ### 5.2 Linux / X11
 
@@ -260,11 +251,8 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
 - 工作区：读 `_NET_WORKAREA` 的当前桌面项（多屏时为各屏并集），与窗口所在显示器矩形取交集；取不到时退回显示器矩形
 - 启动定位：KWin 会忽略窗口映射前发出的移动请求，所以启动后 2 秒内每 500 ms 重发一次位置与置顶，
   用户开始拖动后停止重发
-- 交互浮层：eframe 的 deferred viewport（`ViewportId::from_hash_of("whale-pet-overlay")`）。窗口每次宠物的 pass
-  都要重新 `show_viewport_deferred`（egui 会回收上一帧没用到的子视口），builder 每帧整段覆盖：位置 =
-  主窗口位置 − 浮层偏移，尺寸 760×480 逻辑点，`Transient` 时 `MousePassthrough(true)`，`Hidden` 时不可见。
-  子窗口首次显示后要再发一次 `WindowLevel::AlwaysOnTop`（X11 的 winit 只在创建时应用层级，而 eframe 建子窗口时
-  是隐藏的），并 `request_repaint_of` 唤醒它——子视口只在它自己请求重绘或收到输入时才运行 pass。
+- 交互控件：与宠物共享 eframe 根视口。X11 SHAPE 随菜单状态在整窗和偏移后的宠物命中区之间切换，
+  相同输入区不重复下发。
 
 ### 5.3 Windows
 
@@ -286,27 +274,21 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
 
 工作区：`GetMonitorInfoW.rcWork`，与 X11 的 `_NET_WORKAREA` 语义一致；取不到时退回显示器矩形。
 
-浮层：与主窗口一样走 eframe 子视口，子窗口继承共享 `WgpuSetup` 的 DX12 交换链与无重定向位图补丁
-（`egui-winit` 在建窗时按 `window_attributes.transparent()` 判定）。模式为 `Transient` 时整窗
-`MousePassthrough`；菜单打开时整窗可交互。
+交互控件：与宠物共用根窗口和 DX12 交换链。菜单打开时整窗可交互，其余时候按偏移后的宠物命中区切换穿透。
+窗口显式关闭阴影，vendored egui-winit 在创建无边框窗口时尊重 `has_shadow`。
 
 ### 5.4 vendored egui-winit
 
 `third_party/egui-winit/` 是 egui-winit 0.37.0 的原始副本，通过根 `Cargo.toml` 的 `[patch.crates-io]` 覆盖。
-唯一改动是新增 `set_transparent_no_redirection_bitmap`。`.cargo_vcs_info.json` 记录上游提交
+本地补丁提供 `set_transparent_no_redirection_bitmap`，并让 Windows 无边框窗口尊重 `has_shadow`。
+`.cargo_vcs_info.json` 记录上游提交
 `7c0b40402271e8d40cda69f87cf3c2617c2e4382`，便于比对。
 
 ## 6. 已知限制
 
 - 原生 Wayland 的热插拔与跨屏：layer surface 绑定单个输出，输出消失时停在最后已知几何，不会重建 surface
-  （交互浮层在宠物换到另一个输出时会重建，但输出消失本身仍按最后几何处理）
-- 原生 Wayland 启动后极短时间内若 `wl_surface.enter` 还没到，会先按「第一个报告逻辑尺寸的输出」建一次浮层；
-  `enter` 到达后按 `belongs_to` 立即重建（见 7.4 的 51 ms 实测）。浮层在此期间是隐藏的，不影响交互，只是多一次创建
 - 原生 Wayland 的拖动起点必须在命中框内：输入区外的点击不产生按下事件（这正是穿透的实现方式）
 - 原生 Wayland 需要合成器提供 `zwlr_layer_shell_v1`；不提供时自动回退 XWayland
-- KWin 在浮层输入区变化后不会立刻重新选择 surface：`set_input_region` 从空变为整窗（或反向）之后，
-  `wl_pointer.enter` 要等下一次真实指针移动才到，期间浮层收不到 hover。菜单打开的首帧用宠物侧报告的屏幕坐标
-  做命中测试（右键位置，且宠物此时已停止移动），要等一次真实移动之后才由 `wl_pointer` 自己的位置接管
 - 浮层固定 760×480 逻辑点：三级菜单在贴边时会夹在浮层窗口内，超长列表靠滚动查看
 - 指纹/触摸、输入法未接入；只处理鼠标左键/右键与键盘 `Ctrl+Q`（菜单打开时额外处理 Esc）
 - `--stats` 仅 Linux 实现
@@ -314,7 +296,8 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
   ui pass，因为末帧要先绘制一次
 - `anim-meta.json` 必须与素材一同发布；缺少它时所有切换都从第 0 帧开始（仍有硬切，没有淡入）。素材被换成更短的
   版本而元数据未重生成时，若选中的入场帧超出新片长，该 clip 会打 warning 并退回第 0 帧重播，不会计入解码失败
-- 未验证：Windows 宿主上的实跑、小时级连续播放（解码线程与内存的长期行为），以及「素材替换但元数据未重生成」
+- 飞行途中偶发的视觉震动尚未定位；逻辑轨迹测试与虚拟输出截图不能证明物理显示器上的逐帧稳定性
+- 未验证：小时级连续播放（解码线程与内存的长期行为），以及「素材替换但元数据未重生成」
   的现实场景（只验证了截短片长的构造场景与单 clip 校验）
 - 没有安装包与发布流程，只能从源码构建
 - 只解码视频轨，没有音频
@@ -322,6 +305,11 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
   以及菜单里的 open-site / reload / set-display 都不存在；`animations.events` 只解析不使用
 
 ## 7. 验证记录
+
+以下 7.1–7.5 保留早期独立浮层实现的历史记录，其中窗口数量与尺寸不代表当前单窗口设计。
+当前单窗口版本在 Windows 虚拟机完成菜单浏览、慢拖停住与快甩复验，窗口枚举仅有一个可见宠物顶层窗口。
+Linux 已完成 X11 与原生 Wayland 的交互检查；独立 KWin 虚拟输出在宿主锁屏时通过 EIS 注入快甩，
+并取得合成截图与落地日志。逐张截图只有约 4–5 fps，不作为偶发单帧震动已消失的证明。
 
 原生 Wayland（KDE Wayland 6.3.6，DP-2 缩放 1.5，debug 构建）：日志确认 `fractional scale 1.5` →
 `427x240 logical`、`surface on DP-2 at (1440, 560)`；协议日志确认 `set_size(427, 240)`、

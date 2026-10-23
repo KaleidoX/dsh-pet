@@ -3,10 +3,8 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask", "tools/anim-meta"]
 default-members = ["crates/*", "apps/whale-pet", "xtask"]
 
-# whale-pet needs one thing egui-winit cannot do upstream: create a transparent
-# Windows window without a DWM redirection surface (`WS_EX_NOREDIRECTIONBITMAP`),
-# which winit only accepts at creation time. The fork carries that single
-# addition; see third_party/egui-winit/Cargo.toml.
+# Windows transparency and borderless shadows need window creation options not
+# exposed by upstream egui-winit; see third_party/egui-winit/Cargo.toml.
 [patch.crates-io]
 egui-winit = { path = "third_party/egui-winit" }
 

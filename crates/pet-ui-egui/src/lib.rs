@@ -20,7 +20,7 @@
 //! this crate only feeds it winit's input and applies the result to the window.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -30,7 +30,7 @@ use egui::{Pos2, Vec2};
 #[cfg(target_os = "windows")]
 use pet_config::HIT_BOX;
 use pet_config::{CANVAS_H, CANVAS_W, PetConfig, WorldArea};
-use pet_overlay::{OverlayMode, OverlayState, overlay_placement};
+use pet_overlay::{PetScene, SceneLayout};
 use pet_ui_core::{FrameInput, PetCore, anchor_position};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
@@ -38,10 +38,6 @@ use winit::window::Window;
 #[cfg(target_os = "linux")]
 mod x11;
 
-/// Viewport id of the interaction overlay window.
-fn overlay_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("whale-pet-overlay")
-}
 /// How often the work area is re-read (a panel may be added or resized).
 const WORLD_REFRESH: Duration = Duration::from_secs(2);
 
@@ -62,10 +58,11 @@ pub fn run(asset_dir: PathBuf, config: PetConfig, options: RunOptions) -> eframe
         .with_title("whale-pet")
         .with_app_id("whale-pet")
         // Placeholder size in points; the native window is resized to the exact
-        // 640x360 physical pixels in the app creator, once the scale is known.
+        // canvas plus control margins in the app creator, once the scale is known.
         .with_inner_size([CANVAS_W as f32, CANVAS_H as f32])
         .with_resizable(false)
         .with_decorations(false)
+        .with_has_shadow(false)
         .with_transparent(true)
         .with_taskbar(false)
         .with_active(false)
@@ -119,8 +116,9 @@ struct PetApp {
     /// overlay menu is clamped to it.
     world: WorldArea,
     world_read: Instant,
-    /// Shared with the overlay viewport's draw callback.
-    overlay: Arc<Mutex<OverlayState>>,
+    /// Pet and controls composed synchronously in this window.
+    scene: PetScene,
+    layout: SceneLayout,
     /// Where the configured corner/margins put the window. KWin ignores moves
     /// issued before the window is mapped, so this is re-applied for a short
     /// while after startup (and dropped once the user drags the pet).
@@ -129,12 +127,6 @@ struct PetApp {
     /// hint under XWayland, but honours a runtime request).
     on_top_until: Instant,
     on_top_next: Instant,
-    /// Whether the overlay window was visible on the previous frame.
-    ///
-    /// The overlay is created hidden (eframe always does that), and winit on
-    /// X11 only applies the window level at creation time when the window is
-    /// visible, so the level has to be re-sent when the window is first shown.
-    overlay_visible: bool,
     #[cfg(target_os = "linux")]
     x11: Option<x11::X11>,
     /// Windows: whether the window currently ignores the pointer. The whole
@@ -153,15 +145,16 @@ impl PetApp {
         let window = cc.winit_window().cloned().ok_or_else(|| anyhow!("eframe did not provide a native window"))?;
         let ppp = window.scale_factor() as f32;
 
-        // The window is not visible yet; fixing the exact physical size now
+        // The window is not visible yet; fixing the composed physical size now
         // avoids the first-frame `InnerSize` round trip and the compositor never
         // sees the placeholder size.
-        let _ = window.request_inner_size(PhysicalSize::new(CANVAS_W, CANVAS_H));
+        let mut layout = SceneLayout::new(ppp);
+        let _ = window.request_inner_size(PhysicalSize::new(layout.size.0, layout.size.1));
 
         #[cfg(target_os = "linux")]
         let x11 = match x11::X11::new(&window) {
-            Ok(x11) => {
-                if let Err(err) = x11.set_input_region() {
+            Ok(mut x11) => {
+                if let Err(err) = x11.set_input_region(layout, false) {
                     log::warn!("cannot restrict the input region (clicks outside the pet reach the window): {err:#}");
                 }
                 Some(x11)
@@ -178,7 +171,7 @@ impl PetApp {
         let world = read_world(&window, x11.as_ref());
         #[cfg(not(target_os = "linux"))]
         let world = read_world(&window);
-        let requested = place_window(&window, &config.position(), world);
+        let requested = place_window(&window, &config.position(), world, &mut layout);
         window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
 
         // Even without decorations DWM draws a thin frame and shadow around the
@@ -197,12 +190,22 @@ impl PetApp {
             }
         }
 
-        let overlay = OverlayState::new(&asset_dir, &config);
+        let scene = PetScene::new(&asset_dir, &config);
         let core = PetCore::new(asset_dir, &config, options.stats)?;
 
         let last_pos = window.outer_position().unwrap_or(requested);
         let now = Instant::now();
-        log::info!("window at {},{} ({}x{} physical), scale {ppp}, idle clip {}", last_pos.x, last_pos.y, CANVAS_W, CANVAS_H, core.clip_name());
+        log::info!(
+            "window at {},{} ({}x{} physical), canvas {}x{} at {:?}, scale {ppp}, idle clip {}",
+            last_pos.x,
+            last_pos.y,
+            layout.size.0,
+            layout.size.1,
+            CANVAS_W,
+            CANVAS_H,
+            layout.offset,
+            core.clip_name()
+        );
         if options.stats && !cfg!(target_os = "linux") {
             log::warn!("--stats is only implemented on Linux");
         }
@@ -214,11 +217,11 @@ impl PetApp {
             last_pos,
             world,
             world_read: now,
-            overlay: Arc::new(Mutex::new(overlay)),
+            scene,
+            layout,
             target_pos: Some(requested),
             on_top_until: now + Duration::from_secs(2),
             on_top_next: now,
-            overlay_visible: false,
             #[cfg(target_os = "linux")]
             x11,
             #[cfg(target_os = "windows")]
@@ -327,7 +330,9 @@ impl PetApp {
         // A press keeps the window interactive even after the pointer leaves the
         // hit box: winit installed the mouse capture on button-down, and a
         // click-through window would never see the release.
-        let passthrough = !self.core.has_press() && !HIT_BOX.contains(canvas_x, canvas_y);
+        let passthrough = !self.core.has_press()
+            && !self.scene.menu_open()
+            && !HIT_BOX.contains(canvas_x - self.layout.offset.0 as f32, canvas_y - self.layout.offset.1 as f32);
         if passthrough != self.passthrough {
             log::debug!("passthrough {passthrough}");
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
@@ -357,17 +362,23 @@ impl eframe::App for PetApp {
             self.on_top_next = now + Duration::from_millis(500);
         }
 
-        // Drain the overlay first: an action picked there (including "closed")
-        // must reach the core before this frame computes its overlay intent, or
-        // a stale `Menu` intent would immediately reopen the menu.
-        let actions = self.overlay.lock().map(|mut overlay| overlay.take_actions()).unwrap_or_default();
-        for action in actions {
-            self.core.overlay_action(action);
+        let ppp = ctx.pixels_per_point();
+        if (ppp - self.ppp).abs() > 0.001 {
+            let origin = self.window.outer_position().unwrap_or(self.last_pos);
+            let canvas = self.layout.canvas_origin((origin.x, origin.y));
+            self.ppp = ppp;
+            self.layout = SceneLayout::new(ppp);
+            let size = self.layout.size;
+            let _ = self.window.request_inner_size(PhysicalSize::new(size.0, size.1));
+            let origin = self.layout.place(canvas, self.world);
+            self.last_pos = PhysicalPosition::new(origin.0, origin.1);
+            self.window.set_outer_position(self.last_pos);
+            self.target_pos = None;
         }
-
         let input = self.frame_input(&ctx, now);
-        let out = self.core.ui(ui, input);
+        let out = self.scene.ui(ui, &mut self.core, input, &mut self.layout);
         if let Some(pos) = out.move_to {
+            let pos = self.layout.window_origin(pos);
             self.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
             self.last_pos = PhysicalPosition::new(pos.0, pos.1);
         }
@@ -378,94 +389,18 @@ impl eframe::App for PetApp {
             ctx.set_cursor_icon(cursor);
         }
 
-        let origin = self.window.outer_position().unwrap_or(self.last_pos);
-        let origin = (origin.x, origin.y);
-        let mode = if let Ok(mut overlay) = self.overlay.lock() {
-            overlay.set_world(input.world, self.ppp);
-            // The overlay window cannot be trusted to report its own pointer:
-            // before it has been placed, a motion event arrives in screen
-            // coordinates and egui keeps that value for later passes. Hand it
-            // the global cursor the host already reads every frame.
-            overlay.set_input(pet_overlay::OverlayInput { pointer: input.global });
-            if let Some(score) = out.score {
-                overlay.apply_score(score);
+        #[cfg(target_os = "linux")]
+        if let Some(x11) = &mut self.x11 {
+            if let Err(err) = x11.set_input_region(self.layout, self.scene.menu_open()) {
+                log::warn!("cannot update input region: {err:#}");
             }
-            overlay.apply_intent(out.overlay);
-            overlay.tick(now);
-            overlay.mode()
-        } else {
-            OverlayMode::Hidden
-        };
-        self.show_overlay(&ctx, origin, mode, now);
+        }
 
         if out.close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
             #[cfg(target_os = "windows")]
             self.update_passthrough(&ctx);
-        }
-    }
-}
-
-impl PetApp {
-    /// Draws the interaction overlay in its own deferred viewport.
-    ///
-    /// The viewport has to be requested on every pet pass: egui drops any child
-    /// viewport that was not used in the last pass, and the whole builder is
-    /// replaced each time, so size and position follow the pet window.
-    fn show_overlay(&mut self, ctx: &egui::Context, origin: (i32, i32), mode: OverlayMode, now: Instant) {
-        let (position, size) = overlay_placement(origin, self.ppp);
-        let builder = egui::ViewportBuilder::default()
-            .with_title("whale-pet-overlay")
-            .with_app_id("whale-pet-overlay")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_active(false)
-            .with_close_button(false)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_position(position)
-            .with_inner_size(size)
-            // Hidden windows are not painted at all; `Transient` shows the
-            // tooltip/score but lets every click through to whatever is below.
-            .with_visible(mode != OverlayMode::Hidden)
-            .with_mouse_passthrough(mode == OverlayMode::Transient);
-
-        let overlay = Arc::clone(&self.overlay);
-        let timestamp = now;
-        ctx.show_viewport_deferred(overlay_id(), builder, move |ui, _class| {
-            // The host derived the mode for this frame; the callback must not
-            // derive it again (a hidden viewport runs no pass at all).
-            let Ok(mut overlay) = overlay.lock() else { return };
-            let ctx = ui.ctx().clone();
-            // The window manager may clamp the requested position (a window
-            // hanging off the screen edge is normal here), so the drawing maps
-            // screen anchors against the position the window really got.
-            if let Some(rect) = ui.input(|input| input.viewport().outer_rect) {
-                let ppp = ctx.pixels_per_point();
-                overlay.set_window_origin(((rect.min.x * ppp).round() as i32, (rect.min.y * ppp).round() as i32));
-            }
-            // A repaint is only needed while something moves; the pet's own
-            // pass asks for one as long as the popups live.
-            if overlay.ui(&ctx, ui, timestamp) {
-                ctx.request_repaint();
-            }
-        });
-        if mode != OverlayMode::Hidden && !self.overlay_visible {
-            // eframe creates child viewports hidden, and winit on X11 applies
-            // `with_window_level` only at creation when the window is visible.
-            // Without this the overlay keeps the level it was created with and
-            // stays below the pet window, where the menu can never be clicked.
-            ctx.send_viewport_cmd_to(overlay_id(), egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-        }
-        self.overlay_visible = mode != OverlayMode::Hidden;
-        if mode != OverlayMode::Hidden {
-            // Registering the viewport does not wake it: a child pass only runs
-            // when the child itself asks for one (or its window receives input),
-            // so without this the menu would stay undrawn after it opens on an
-            // already-visible overlay.
-            ctx.request_repaint_of(overlay_id());
         }
     }
 }
@@ -545,9 +480,10 @@ fn monitor_world(window: &Window) -> WorldArea {
 ///
 /// Margins are logical pixels (as in the web client); the work area and the
 /// resulting position are physical screen pixels.
-fn place_window(window: &Window, position: &pet_config::Position, world: WorldArea) -> PhysicalPosition<i32> {
+fn place_window(window: &Window, position: &pet_config::Position, world: WorldArea, layout: &mut SceneLayout) -> PhysicalPosition<i32> {
     let (x, y) = anchor_position(world, position, window.scale_factor() as f32);
-    let pos = PhysicalPosition::new(x.round() as i32, y.round() as i32);
+    let origin = layout.place((x.round() as i32, y.round() as i32), world);
+    let pos = PhysicalPosition::new(origin.0, origin.1);
     window.set_outer_position(pos);
     pos
 }

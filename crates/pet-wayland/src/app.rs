@@ -1,31 +1,7 @@
-//! The layer-surface host: protocol handlers, the egui pass and the frame.
-//!
-//! One `zwlr_layer_surface_v1` is the whole window. It is anchored to a corner
-//! with margins (see `surface.rs`), sized in output-logical pixels, and backed
-//! by a fixed `640 × 360` swapchain whose logical size is expressed with
-//! `wp_viewport`. egui runs against that logical rectangle with
-//! `pixels_per_point = ppp`, so `PetCore` sees the same input shape as under
-//! eframe and produces the same `FrameOutput`.
-//!
-//! # The interaction overlay
-//!
-//! Tooltips, the score card and the context menu live in a second layer surface
-//! on [`Layer::Overlay`], so the pet window keeps its exact `640 × 360` canvas.
-//! That surface is `760 × 480` logical points, follows the pet's position every
-//! frame, and switches its input region with the overlay mode: empty (clicks
-//! pass through) while it only paints, the whole surface while the menu is
-//! open. Its `OverlayState` runs in its own [`egui::Context`] with its own
-//! pointer and keyboard, because a Wayland pointer only reports positions
-//! inside the surface it entered.
-//!
-//! The protocol handlers only translate events into egui events and set
-//! [`Self::dirty`]; the drawing, placement and cursor work happens in
-//! [`Self::draw`], driven by the loop in `lib.rs`.
-//!
-//! **Drop order matters.** Rust drops struct fields in declaration order, so
-//! `gpu` is declared first (wgpu keeps raw pointers into the `wl_surface` and
-//! `wl_display`), then the overlay window (its own `Wgpu` before its
-//! `LayerSurface`), the protocol objects next, and the `Connection` last.
+//! Single layer-surface host. Pet and controls share one egui context,
+//! input stream and swapchain. Placement tracks the canvas origin; native
+//! surface margins include the transparent space around that canvas.
+//! GPU resources precede protocol objects in drop order.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -33,7 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use egui::{Event, Pos2, Rect, ViewportId, ViewportInfo};
 use pet_config::{CANVAS_H, CANVAS_W, PetConfig, WorldArea};
-use pet_ui_core::{FrameInput, FrameOutput, OverlayAction, PetCore};
+use pet_overlay::{PetScene, SceneLayout};
+use pet_ui_core::{FrameInput, FrameOutput, PetCore};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::globals::GlobalData;
 use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
@@ -57,7 +34,6 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::input;
-use crate::overlay::{self, Overlay};
 use crate::surface::{self, Placement};
 use crate::wgpu::Wgpu;
 
@@ -122,21 +98,12 @@ pub(crate) struct WaylandApp {
     /// Declared first so it is destroyed before the surface/display it refers
     /// to: wgpu keeps raw pointers into both.
     gpu: Wgpu,
-    /// The interaction overlay, created once the compositor reported which
-    /// output the pet is on. `None` means output is still unknown, the overlay
-    /// could not be created, or the compositor closed it.
-    overlay: Option<Overlay>,
-    /// Set when creating the overlay failed; it is not retried, since the same
-    /// failure would repeat every frame.
-    overlay_disabled: bool,
+    scene: PetScene,
+    input_region: Option<Rect>,
 
     pointer: Option<ThemedPointer<PointerData>>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     viewporter: Option<WpViewport>,
-    /// Kept to give the overlay its own viewport.
-    viewporter_global: Option<SimpleGlobal<WpViewporter, 1>>,
-    /// Kept to create the overlay's layer surface.
-    layer_shell: LayerShell,
     /// Kept alive for the protocol object; its only event updates `ppp` through
     /// the `Dispatch` impl below, so the handle itself is never read.
     #[allow(dead_code)]
@@ -155,11 +122,8 @@ pub(crate) struct WaylandApp {
     core: PetCore,
     ctx: egui::Context,
     start: Instant,
-    /// Assets and configuration, kept so the overlay can build its own state.
-    asset_dir: PathBuf,
-    config: PetConfig,
-    qh: QueueHandle<WaylandApp>,
 
+    layout: SceneLayout,
     ppp: f32,
     /// Whether `ppp` came from `wp_fractional_scale_v1`; if so, integer output
     /// scales must not overwrite it.
@@ -179,8 +143,6 @@ pub(crate) struct WaylandApp {
     cursor: Option<egui::CursorIcon>,
 
     pending_events: Vec<Event>,
-    /// Menu choices the overlay reported, applied before the pet's next pass.
-    overlay_actions: Vec<OverlayAction>,
     configured: bool,
     dirty: bool,
     exit: bool,
@@ -212,7 +174,7 @@ impl WaylandApp {
         // and their geometry arrives as events. `run` performs the first
         // roundtrip and then calls `select_output`.
         let ppp = 1.0;
-        let logical = surface::logical_size(ppp);
+        let logical = surface::window_size(ppp);
         let placement = Placement::from_position(&config.position());
         let output_position = (0, 0);
         let output_size = (0, 0);
@@ -240,29 +202,28 @@ impl WaylandApp {
         // Negative exclusive zone: reserve no space in the work area.
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-        placement.apply(&layer);
-        if let Err(err) = surface::set_hit_region(&compositor, &layer, ppp) {
+        placement.apply_canvas(&layer, SceneLayout::new(ppp));
+        if let Err(err) = surface::set_input_region(&compositor, &layer, SceneLayout::new(ppp), false) {
             log::warn!("cannot restrict the input region (clicks outside the pet reach the surface): {err:#}");
         }
         // The first commit must carry no buffer; it is what makes the
         // compositor send the initial configure.
         layer.commit();
 
-        let gpu = Wgpu::new(conn, layer.wl_surface(), (CANVAS_W, CANVAS_H))?;
+        let gpu = Wgpu::new(conn, layer.wl_surface(), SceneLayout::new(ppp).size)?;
 
-        let core = PetCore::new(asset_dir.clone(), config, stats)?;
+        let scene = PetScene::new(&asset_dir, config);
+        let core = PetCore::new(asset_dir, config, stats)?;
         let start = Instant::now();
         log::info!("native Wayland (layer shell), axis scale {ppp}, canvas {}x{} physical", CANVAS_W, CANVAS_H);
 
         Ok(Self {
             gpu,
-            overlay: None,
-            overlay_disabled: false,
+            scene,
+            input_region: None,
             pointer: None,
             keyboard: None,
             viewporter: viewport,
-            viewporter_global: viewporter,
-            layer_shell,
             fractional_scale,
             layer,
             registry_state,
@@ -276,9 +237,7 @@ impl WaylandApp {
             core,
             ctx: egui::Context::default(),
             start,
-            asset_dir,
-            config: config.clone(),
-            qh: qh.clone(),
+            layout: SceneLayout::new(ppp),
             ppp,
             fractional: false,
             logical,
@@ -288,7 +247,6 @@ impl WaylandApp {
             pointer_global: None,
             cursor: None,
             pending_events: Vec::new(),
-            overlay_actions: Vec::new(),
             configured: false,
             dirty: true,
             exit: false,
@@ -342,7 +300,8 @@ impl WaylandApp {
         self.output_size = size;
         if !self.fractional && (self.ppp - scale).abs() > 0.01 {
             self.ppp = scale;
-            self.logical = surface::logical_size(scale);
+            self.layout = SceneLayout::new(scale);
+            self.logical = surface::window_size(scale);
             self.layer.set_size(self.logical.0, self.logical.1);
             self.apply_surface_state();
         }
@@ -372,7 +331,8 @@ impl WaylandApp {
         }
 
         let now = Instant::now();
-        let (width, height) = PetCore::logical_size(self.ppp);
+        let size = self.layout.size_points();
+        let (width, height) = (size.x, size.y);
         let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height));
         let mut raw = egui::RawInput {
             viewport_id: ViewportId::ROOT,
@@ -387,21 +347,16 @@ impl WaylandApp {
         // canvas would be laid out at 1.0 and rendered at the wrong scale.
         raw.viewports.insert(ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(self.ppp), ..Default::default() });
 
-        // Menu choices picked in the overlay reach the pet before its pass
-        // computes the overlay intent, or a stale `Menu` intent would reopen
-        // the menu right after it closed.
-        for action in std::mem::take(&mut self.overlay_actions) {
-            self.core.overlay_action(action);
-        }
-
         let ppp = self.ppp;
-        let origin = self.window_origin();
+        let origin = self.layout.window_origin(self.window_origin());
         let world = self.world();
         let global = self.pointer_global;
         let button_down = Some(self.pointer_down);
         let mut frame_out = FrameOutput::default();
         let ctx = &self.ctx;
         let core = &mut self.core;
+        let scene = &mut self.scene;
+        let layout = &mut self.layout;
         let full = ctx.run_ui(raw, |ui| {
             let ui_ctx = ui.ctx().clone();
             let (pressed, released, secondary_pressed, pointer, dt) = ui_ctx.input(|input| {
@@ -413,9 +368,11 @@ impl WaylandApp {
                     input.stable_dt,
                 )
             });
-            frame_out = core.ui(
+            frame_out = scene.ui(
                 ui,
+                core,
                 FrameInput { now, dt, ppp, pointer, pressed, released, secondary_pressed, global, button_down, window_origin: origin, world },
+                layout,
             );
         });
 
@@ -425,20 +382,14 @@ impl WaylandApp {
             self.move_window(target);
         }
 
+        let layout = self.layout;
+        self.update_input_region()?;
         let primitives = self.ctx.tessellate(full.shapes, full.pixels_per_point);
-        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [CANVAS_W, CANVAS_H], pixels_per_point: self.ppp };
+        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [layout.size.0, layout.size.1], pixels_per_point: self.ppp };
         let mut textures = full.textures_delta;
         self.gpu.draw(&primitives, &screen, &mut textures)?;
 
         self.next_repaint = full.viewport_output.get(&ViewportId::ROOT).map_or(Duration::from_secs(1), |viewport| viewport.repaint_delay);
-
-        // The overlay draws after the pet and moves its own surface; both are
-        // committed by their respective presents above and below.
-        let overlay = self.draw_overlay(now, &frame_out);
-        if let Some(pass) = overlay {
-            self.next_repaint = self.next_repaint.min(pass.repaint);
-            self.overlay_actions = pass.actions;
-        }
 
         if let Some(icon) = frame_out.cursor {
             self.apply_cursor(icon);
@@ -449,78 +400,9 @@ impl WaylandApp {
         Ok(())
     }
 
-    /// Runs the overlay's pass, creating its surface on first use.
-    ///
-    /// The overlay follows the pet and lives on the same output; it is only
-    /// built once that output is known, which happens with the first configure
-    /// or `surface_enter`. A failure here is reported once and then disables the
-    /// overlay: the pet itself keeps working.
-    fn draw_overlay(&mut self, now: Instant, out: &FrameOutput) -> Option<overlay::Pass> {
-        if self.output_size == (0, 0) {
-            return None;
-        }
-        // A layer surface is bound to one output for its whole life, so an
-        // overlay built for the wrong monitor is dropped and rebuilt instead of
-        // being moved: it would otherwise stay behind on the old output.
-        if self.overlay.as_ref().is_some_and(|overlay| !overlay.belongs_to(self.output.as_ref())) {
-            log::info!("the pet moved to another output; rebuilding the interaction overlay");
-            self.overlay = None;
-        }
-        if self.overlay.is_none() && !self.overlay_disabled {
-            match self.create_overlay() {
-                Ok(overlay) => self.overlay = Some(overlay),
-                Err(err) => {
-                    log::warn!("cannot create the interaction overlay, continuing without it: {err:#}");
-                    // Mark it as attempted so the failure is logged once.
-                    self.overlay_disabled = true;
-                    return None;
-                }
-            }
-        }
-        let pet_local = self.placement.local_origin(self.output_size, self.logical);
-        let world = self.world();
-        let overlay = self.overlay.as_mut()?;
-        let frame = overlay::Frame {
-            now,
-            time: self.start.elapsed().as_secs_f64(),
-            ppp: self.ppp,
-            pet_local,
-            output_position: self.output_position,
-            output_size: self.output_size,
-            world,
-            pet_pointer: self.pointer_global,
-            out,
-        };
-        match overlay.draw(frame) {
-            Ok(pass) => Some(pass),
-            Err(err) => {
-                log::warn!("the interaction overlay stopped: {err:#}");
-                self.overlay = None;
-                self.overlay_disabled = true;
-                None
-            }
-        }
-    }
-
-    fn create_overlay(&self) -> Result<Overlay> {
-        Overlay::new(overlay::Builder {
-            compositor: &self.compositor,
-            layer_shell: &self.layer_shell,
-            viewporter: self.viewporter_global.as_ref(),
-            qh: &self.qh,
-            output: self.output.as_ref(),
-            parent: &self.gpu,
-            asset_dir: &self.asset_dir,
-            config: &self.config,
-            ppp: self.ppp,
-            pet_local: self.placement.local_origin(self.output_size, self.logical),
-            output_size: self.output_size,
-        })
-    }
-
     /// Top-left of the surface in canvas pixels.
     fn window_origin(&self) -> (i32, i32) {
-        let (x, y) = self.placement.local_origin(self.output_size, self.logical);
+        let (x, y) = self.placement.local_origin(self.output_size, surface::logical_size(self.ppp));
         (((self.output_position.0 as f32 + x) * self.ppp).round() as i32, ((self.output_position.1 as f32 + y) * self.ppp).round() as i32)
     }
 
@@ -544,19 +426,13 @@ impl WaylandApp {
 
     /// Moves the surface so its top-left lands on `target` (canvas pixels).
     fn move_window(&mut self, target: (i32, i32)) {
-        // Without a rectangle for the output the margins cannot be clamped, and
-        // an unclamped drag would fight the compositor. This only happens when
-        // `surface_enter` never arrived.
+        // Resolve output geometry before converting the canvas target to margins.
         if self.output_size == (0, 0) {
             self.select_output();
         }
         let local = (target.0 as f32 / self.ppp - self.output_position.0 as f32, target.1 as f32 / self.ppp - self.output_position.1 as f32);
-        let before = self.placement.local_origin(self.output_size, self.logical);
-        self.placement.set_local_origin(local, self.output_size, self.logical);
-        let after = self.placement.local_origin(self.output_size, self.logical);
-        if (after.0 - before.0).abs() > f32::EPSILON || (after.1 - before.1).abs() > f32::EPSILON {
-            self.placement.apply(&self.layer);
-        }
+        self.placement.set_local_origin(local, self.output_size, surface::logical_size(self.ppp));
+        self.placement.apply_canvas(&self.layer, self.layout);
     }
 
     /// Recomputes the double-buffered surface state for the current scale.
@@ -565,12 +441,23 @@ impl WaylandApp {
     /// that is the commit `Queue::present` issues, so this must run before
     /// [`Wgpu::draw`].
     fn apply_surface_state(&mut self) {
+        self.gpu.resize(SceneLayout::new(self.ppp).size);
+        self.placement.apply_canvas(&self.layer, SceneLayout::new(self.ppp));
         if let Some(viewport) = &self.viewporter {
             viewport.set_destination(self.logical.0 as i32, self.logical.1 as i32);
         }
-        if let Err(err) = surface::set_hit_region(&self.compositor, &self.layer, self.ppp) {
+        if let Err(err) = self.update_input_region() {
             log::warn!("cannot update the input region: {err:#}");
         }
+    }
+
+    fn update_input_region(&mut self) -> Result<()> {
+        let rect = if self.scene.menu_open() { Rect::from_min_size(Pos2::ZERO, self.layout.size_points()) } else { self.layout.hit_rect() };
+        if self.input_region != Some(rect) {
+            surface::set_input_region(&self.compositor, &self.layer, self.layout, self.scene.menu_open())?;
+            self.input_region = Some(rect);
+        }
+        Ok(())
     }
 
     /// Switches to a fractional scale reported by the compositor.
@@ -584,13 +471,11 @@ impl WaylandApp {
         }
         log::info!("fractional scale {ppp}");
         self.ppp = ppp;
-        self.logical = surface::logical_size(ppp);
+        self.layout = SceneLayout::new(ppp);
+        self.logical = surface::window_size(ppp);
         log::info!("{}x{} logical, canvas {}x{} physical", self.logical.0, self.logical.1, CANVAS_W, CANVAS_H);
         self.layer.set_size(self.logical.0, self.logical.1);
         self.apply_surface_state();
-        if let Some(overlay) = &mut self.overlay {
-            overlay.set_scale(ppp);
-        }
         self.dirty = true;
     }
 
@@ -701,34 +586,15 @@ impl OutputHandler for WaylandApp {
 }
 
 impl LayerShellHandler for WaylandApp {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        if let Some(overlay) = &mut self.overlay
-            && overlay.owns(layer)
-        {
-            // The overlay is disposable: drop it and keep the pet. It is not
-            // recreated, since a compositor that closed it once will likely do
-            // so again.
-            log::warn!("the compositor closed the interaction overlay; continuing without it");
-            self.overlay = None;
-            self.overlay_disabled = true;
-            self.dirty = true;
-            return;
-        }
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
         log::info!("the layer surface was closed by the compositor");
         self.exit = true;
     }
 
-    fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
+    fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
         // sctk already acked this configure; acking again would be a protocol
         // error. The suggested size is only a hint because the surface is
         // sized explicitly, so it is logged rather than followed.
-        if let Some(overlay) = &mut self.overlay
-            && overlay.owns(layer)
-        {
-            overlay.configured(configure.new_size);
-            self.dirty = true;
-            return;
-        }
         if !self.configured {
             log::info!("first configure: suggested {:?}, using {:?}", configure.new_size, self.logical);
         } else if configure.new_size != (0, 0) && configure.new_size != self.logical {
@@ -775,19 +641,9 @@ impl PointerHandler for WaylandApp {
             return;
         }
         let modifiers = input::egui_modifiers(self.modifiers);
-        // One `wl_pointer` reports every surface the pointer enters, so a frame
-        // can hold events for the pet and for the overlay — moving between them
-        // produces both in one frame. Each surface gets only its own.
-        if let Some(overlay) = &mut self.overlay {
-            let on_overlay: Vec<PointerEvent> = events.iter().filter(|event| event.surface == *overlay.surface()).cloned().collect();
-            if !on_overlay.is_empty() {
-                overlay.pointer_frame(&on_overlay, modifiers);
-            }
-        }
-        let on_pet: Vec<PointerEvent> =
-            events.iter().filter(|event| !self.overlay.as_ref().is_some_and(|overlay| event.surface == *overlay.surface())).cloned().collect();
+        let on_pet: Vec<PointerEvent> = events.iter().filter(|event| event.surface == *self.layer.wl_surface()).cloned().collect();
         if !on_pet.is_empty() {
-            input::translate_frame(&on_pet, modifiers, &mut self.pointer_down, false, &mut self.pending_events);
+            input::translate_frame(&on_pet, modifiers, &mut self.pointer_down, true, &mut self.pending_events);
 
             // Anchor the global position at the moment the event was produced:
             // the surface may move afterwards, and the cursor does not. Wayland
@@ -796,9 +652,12 @@ impl PointerHandler for WaylandApp {
             // each frame would feed the surface's own movement back into the
             // spring.
             if let Some(event) = on_pet.iter().rev().find(|event| !matches!(event.kind, PointerEventKind::Leave { .. })) {
-                let origin = self.window_origin();
+                let origin = self.layout.window_origin(self.window_origin());
                 self.pointer_global =
                     Some((origin.0 as f32 + event.position.0 as f32 * self.ppp, origin.1 as f32 + event.position.1 as f32 * self.ppp));
+            }
+            if on_pet.last().is_some_and(|event| matches!(event.kind, PointerEventKind::Leave { .. })) && !self.core.has_press() {
+                self.pointer_global = None;
             }
         }
 
@@ -846,14 +705,8 @@ impl KeyboardHandler for WaylandApp {
             log::info!("Ctrl+Q pressed");
             self.exit = true;
         }
-        // Escape closes the menu, but the overlay surface never takes the
-        // keyboard, so the key arrives here. It is forwarded to the overlay's
-        // own input state; the pet ignores it.
-        if event.keysym == Keysym::Escape
-            && let Some(overlay) = &mut self.overlay
-            && overlay.shows_menu()
-        {
-            overlay.key(Event::Key {
+        if event.keysym == Keysym::Escape {
+            self.pending_events.push(Event::Key {
                 key: egui::Key::Escape,
                 physical_key: None,
                 pressed: true,
