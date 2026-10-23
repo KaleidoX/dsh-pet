@@ -10,7 +10,9 @@
 //! - a dragged pet that is released while moving fast becomes a projectile that
 //!   bounces off the work-area edges;
 //! - a walk plans a distance in the facing direction and travels it during the
-//!   clip's body, staying still for the clip's lead/tail seconds.
+//!   clip's body, staying still for the clip's lead/tail seconds;
+//! - a clip that ends naturally is followed by entering the next clip at the
+//!   frame whose pose matches the final frame best (see [`pick_entry`]).
 //!
 //! # Units
 //!
@@ -20,7 +22,10 @@
 //! dimensionless ratios are not scaled. Pointer samples are already in canvas
 //! pixels, matching the world the pet moves in.
 
-use pet_config::{CANVAS_H, CANVAS_W, Category, MoveAction, MoveParams, Physics, SIDE_ALLOW, WORLD_SCALE, WorldArea};
+use pet_config::{
+    ALPHA_THRESHOLD, CANVAS_H, CANVAS_W, Category, Frame, GRID_H, GRID_W, Mask, MoveAction, MoveParams, Physics, Pose, SIDE_ALLOW, WORLD_SCALE,
+    WorldArea,
+};
 
 /// Upstream constants, kept in their original 462-wide reference space.
 mod logical {
@@ -622,5 +627,259 @@ impl Spring2 {
         self.vy = spring_step(self.vy, self.y, target.1, dt, power);
         self.x += self.vx * dt;
         self.y += self.vy * dt;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pose matching
+// ---------------------------------------------------------------------------
+//
+// A simplified form of motion matching: every clip carries a cheap pose
+// descriptor for its entry window and its last frame, and a cut from a clip
+// that ended naturally enters the next one at whichever window frame looks
+// closest. There is no blending, no optical flow and no transition animation —
+// the cost only decides which frame to hard-cut to.
+
+/// How different a frame may look from a clip's first frame and still count as
+/// part of the entry window.
+pub const ENTRY_EPS: f32 = 0.03;
+/// Longest entry window, in frames (half a second at 24 fps). Roughly three
+/// quarters of the clips stay still this long.
+pub const ENTRY_MAX_FRAMES: usize = 12;
+/// Smallest cost improvement worth skipping the first frame for.
+pub const ENTRY_MIN_GAIN: f32 = 0.005;
+/// Fraction of the silhouette's height that counts as the head.
+const HEAD_FRACTION: f32 = 0.25;
+
+/// Describes one frame from its [`GRID_W`] x [`GRID_H`] RGBA downsample.
+///
+/// `rgba` must be exactly [`GRID_W`] x [`GRID_H`] tightly packed RGBA; the
+/// native 640x360 frame is accepted only after being resized to the descriptor
+/// grid. The generator does that with swscale's area filter, so a cell holds the
+/// average of its 20x20 block. Alpha above [`ALPHA_THRESHOLD`] marks the cell
+/// opaque. A frame with no opaque cell yields an all-zero descriptor, matching
+/// the "nothing on screen" convention in the metadata.
+///
+/// # Panics
+///
+/// Panics if `rgba` is not exactly the descriptor grid. Both callers (the
+/// offline generator and the tests) build that buffer themselves, so this
+/// catches a wrong grid or stride instead of silently describing a truncated
+/// frame as a mostly transparent one.
+pub fn describe_frame(rgba: &[u8]) -> Pose {
+    assert_eq!(rgba.len(), GRID_W * GRID_H * 4, "describe_frame wants a {GRID_W}x{GRID_H} RGBA grid");
+    let mut pose = Pose::default();
+    let mut area = 0u64;
+    let mut sum_x = 0u64;
+    let mut sum_y = 0u64;
+    let mut sum_r = 0u64;
+    let mut sum_g = 0u64;
+    let mut sum_b = 0u64;
+    let mut left = 0u64;
+    let mut right = 0u64;
+    let mut top = None;
+    let mut bottom = 0usize;
+
+    for y in 0..GRID_H {
+        for x in 0..GRID_W {
+            let i = (y * GRID_W + x) * 4;
+            let pixel = &rgba[i..i + 4];
+            if pixel[3] <= ALPHA_THRESHOLD {
+                continue;
+            }
+            pose.mask.0[y] |= 1 << x;
+            area += 1;
+            sum_x += x as u64;
+            sum_y += y as u64;
+            sum_r += u64::from(pixel[0]);
+            sum_g += u64::from(pixel[1]);
+            sum_b += u64::from(pixel[2]);
+            left += u64::from(x * 2 < GRID_W);
+            right += u64::from(x * 2 >= GRID_W);
+            top.get_or_insert(y);
+            bottom = y;
+        }
+    }
+    let Some(top) = top else { return pose };
+    let area = area as f32;
+    pose.body = [sum_x as f32 / area / GRID_W as f32, sum_y as f32 / area / GRID_H as f32];
+    pose.feet = bottom as f32 / GRID_H as f32;
+    pose.bias = (right as f32 - left as f32) / area;
+    pose.rgb = [(sum_r as f32 / area).round() as u8, (sum_g as f32 / area).round() as u8, (sum_b as f32 / area).round() as u8];
+
+    // The head is the head pixel band of the silhouette, not a fixed slice of
+    // the canvas: the pet does not touch the top of the frame.
+    let head_bottom = top + (((bottom - top) as f32 * HEAD_FRACTION) as usize).max(1);
+    let mut head_area = 0u64;
+    let mut head_x = 0u64;
+    let mut head_y = 0u64;
+    for y in top..=head_bottom.min(GRID_H - 1) {
+        for x in 0..GRID_W {
+            let i = (y * GRID_W + x) * 4;
+            let pixel = &rgba[i..i + 4];
+            if pixel[3] > ALPHA_THRESHOLD {
+                head_area += 1;
+                head_x += x as u64;
+                head_y += y as u64;
+            }
+        }
+    }
+    pose.head = if head_area == 0 {
+        pose.body
+    } else {
+        let head_area = head_area as f32;
+        [head_x as f32 / head_area / GRID_W as f32, head_y as f32 / head_area / GRID_H as f32]
+    };
+    pose
+}
+
+/// How different two poses look: 0 is identical, roughly 1 is completely
+/// different. Covers silhouette overlap, body and head position, foot line,
+/// left/right lean and mean colour, weighted by how visible each is in a cut.
+///
+/// The cost is invariant to mirroring both poses: the masks' row bits reverse,
+/// the centres flip around the middle, `bias` changes sign and the mean colour
+/// is unchanged.
+pub fn pose_cost(a: &Pose, b: &Pose) -> f32 {
+    let silhouette = 1.0 - mask_iou(&a.mask, &b.mask);
+    let body = distance(a.body, b.body) / std::f32::consts::SQRT_2;
+    let head = distance(a.head, b.head) / std::f32::consts::SQRT_2;
+    let feet = (a.feet - b.feet).abs();
+    let bias = (a.bias - b.bias).abs() / 2.0;
+    let rgb = rgb_distance(a.rgb, b.rgb) / (255.0 * 3.0_f32.sqrt());
+    0.45 * silhouette + 0.15 * head + 0.15 * body + 0.10 * feet + 0.05 * bias + 0.10 * rgb
+}
+
+/// Picks the frame of `window` to enter `pose` at.
+///
+/// `window` is the clip's entry frames in playback order, starting at frame 0.
+/// Only the prefix that still looks like frame 0 (cost at most [`ENTRY_EPS`],
+/// at most [`ENTRY_MAX_FRAMES`] frames) is considered, so a skipped opening
+/// never runs past the point where the clip has visibly started moving. The
+/// cheapest frame wins when it saves at least `min_gain` over frame 0; empty
+/// (all-transparent) frames are never entered, and an all-empty window falls
+/// back to frame 0.
+pub fn pick_entry(pose: &Pose, window: &[Frame], min_gain: f32) -> usize {
+    let window = &window[..window.len().min(ENTRY_MAX_FRAMES)];
+    let Some(first) = window.first() else { return 0 };
+    let mut len = 1;
+    while len < window.len() && pose_cost(&first.pose, &window[len].pose) <= ENTRY_EPS {
+        len += 1;
+    }
+
+    let base = pose_cost(pose, &first.pose);
+    let mut best = 0;
+    let mut best_cost = base;
+    for (index, frame) in window[..len].iter().enumerate().skip(1) {
+        // Entering an empty frame would show nothing at all.
+        if frame.pose.is_empty() {
+            continue;
+        }
+        let cost = pose_cost(pose, &frame.pose);
+        if cost < best_cost {
+            best = index;
+            best_cost = cost;
+        }
+    }
+    if base - best_cost < min_gain { 0 } else { best }
+}
+
+fn mask_iou(a: &Mask, b: &Mask) -> f32 {
+    let mut intersection = 0u32;
+    let mut union = 0u32;
+    for (row_a, row_b) in a.0.iter().zip(&b.0) {
+        intersection += (row_a & row_b).count_ones();
+        union += (row_a | row_b).count_ones();
+    }
+    // Two empty masks describe the same (blank) silhouette.
+    if union == 0 { 1.0 } else { intersection as f32 / union as f32 }
+}
+
+fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+fn rgb_distance(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let dr = f32::from(a[0]) - f32::from(b[0]);
+    let dg = f32::from(a[1]) - f32::from(b[1]);
+    let db = f32::from(a[2]) - f32::from(b[2]);
+    dr.hypot(dg).hypot(db)
+}
+
+#[cfg(test)]
+mod pose_tests {
+    use super::*;
+
+    fn pose(mask: [u32; GRID_H], body: [f32; 2], head: [f32; 2], feet: f32, bias: f32, rgb: [u8; 3]) -> Pose {
+        Pose { mask: Mask(mask), body, head, feet, bias, rgb }
+    }
+
+    fn frame(t: u32, pose: Pose) -> Frame {
+        Frame { t, pose }
+    }
+
+    #[test]
+    fn identical_poses_cost_nothing() {
+        let mut mask = [0u32; GRID_H];
+        mask[5] = 0b1_1111;
+        let a = pose(mask, [0.5, 0.5], [0.4, 0.2], 0.9, 0.1, [10, 20, 30]);
+        assert!(pose_cost(&a, &a).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cost_is_symmetric() {
+        let mut left = [0u32; GRID_H];
+        left[4] = 0b1111;
+        let mut right = [0u32; GRID_H];
+        right[7] = 0b11_0000;
+        let a = pose(left, [0.3, 0.4], [0.2, 0.1], 0.8, -0.2, [200, 10, 10]);
+        let b = pose(right, [0.6, 0.7], [0.5, 0.3], 0.95, 0.3, [10, 10, 200]);
+        assert!((pose_cost(&a, &b) - pose_cost(&b, &a)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transparent_frames_describe_as_empty() {
+        let rgba = vec![0u8; GRID_W * GRID_H * 4];
+        let pose = describe_frame(&rgba);
+        assert!(pose.is_empty());
+        assert_eq!(pose, Pose::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "RGBA grid")]
+    fn describe_frame_rejects_a_truncated_grid() {
+        // A short buffer used to be walked with `get` and silently described as
+        // a half-empty frame; it is a caller bug, not a pose.
+        describe_frame(&vec![0u8; GRID_W * GRID_H * 4 - 4]);
+    }
+
+    #[test]
+    fn pick_entry_stays_inside_the_window_and_skips_without_gain() {
+        let mut mask = [0u32; GRID_H];
+        mask[2] = 0b111;
+        let target = pose(mask, [0.5, 0.5], [0.5, 0.3], 0.4, 0.0, [100, 100, 100]);
+        // Close enough to frame 0 that it stays inside the window, but clearly
+        // worse than the target.
+        let shifted = pose(mask, [0.5, 0.56], [0.5, 0.3], 0.4, 0.0, [100, 100, 100]);
+        // Far from frame 0, so the window ends before it.
+        let mut drifting = [0u32; GRID_H];
+        drifting[15] = 0b11_0000_0000_0000;
+        let drifted = pose(drifting, [0.9, 0.9], [0.9, 0.9], 1.0, 0.5, [0, 0, 0]);
+
+        // The drifting frame ends the window, so the perfect match after it is
+        // not a candidate; the best frame inside the window wins instead.
+        let window = vec![frame(0, shifted.clone()), frame(41, target.clone()), frame(82, drifted), frame(123, target.clone())];
+        assert_eq!(pick_entry(&target, &window, ENTRY_MIN_GAIN), 1);
+
+        // Frame 0 already matches perfectly, so no gain is worth skipping.
+        let window = vec![frame(0, target.clone()), frame(41, target.clone())];
+        assert_eq!(pick_entry(&target, &window, ENTRY_MIN_GAIN), 0);
+
+        // A closer later frame wins.
+        let window = vec![frame(0, shifted), frame(41, target.clone())];
+        assert_eq!(pick_entry(&target, &window, ENTRY_MIN_GAIN), 1);
+
+        // Empty windows fall back to frame 0.
+        assert_eq!(pick_entry(&target, &[], ENTRY_MIN_GAIN), 0);
     }
 }
