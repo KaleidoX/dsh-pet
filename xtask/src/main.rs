@@ -3,7 +3,8 @@
 //! `cargo xtask build-ffmpeg --target linux` downloads pinned FFmpeg and libvpx
 //! sources, verifies their checksums and builds the trimmed decoder stack under
 //! `third_party/ffmpeg/out`. Point `FFMPEG_DIR` at that directory when building
-//! the app; `cargo xtask run` does it automatically.
+//! the app; `cargo xtask run` does it automatically. `cargo xtask anim-meta`
+//! regenerates the pose metadata the animation switch reads.
 //!
 //! Only the pieces the pet needs are enabled: the libvpx VP9 decoder, the
 //! Matroska demuxer, the VP9 parser, the file protocol and swscale. See
@@ -43,15 +44,22 @@ fn main_impl() -> Result<()> {
     match args.next().as_deref() {
         Some("build-ffmpeg") => build_ffmpeg(args),
         Some("run") => {
-            let out = workspace_root()?.join("third_party/ffmpeg/out/linux");
-            if !out.join("lib/pkgconfig/vpx.pc").is_file() {
-                bail!("{} is missing; run `cargo xtask build-ffmpeg --target linux` first", out.display());
-            }
+            let out = local_ffmpeg()?;
             cargo_with_ffmpeg(&out, &["run", "--release", "-p", "whale-pet"])
         }
         Some("check") => {
             cargo(&["fmt", "--all", "--check"])?;
-            cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])
+            cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
+            // The pure-logic tests need no FFmpeg build, unlike clippy above.
+            cargo(&["test", "-p", "pet-model", "--lib"])
+        }
+        Some("anim-meta") => {
+            let out = local_ffmpeg()?;
+            // Arguments after the command go straight to the generator.
+            let mut command = vec!["run".to_owned(), "--release".to_owned(), "-p".to_owned(), "anim-meta".to_owned(), "--".to_owned()];
+            command.extend(args);
+            let command = command.iter().map(String::as_str).collect::<Vec<_>>();
+            cargo_with_ffmpeg(&out, &command)
         }
         Some("-h" | "--help") | None => {
             print!(
@@ -61,7 +69,8 @@ cargo xtask <COMMAND>
 COMMANDS:
     build-ffmpeg --target linux|windows [--jobs N]   Build the trimmed FFmpeg + libvpx stack
     run                                              Build and run the pet with the local stack
-    check                                            rustfmt --check + clippy
+    anim-meta [--asset-dir DIR]                      Regenerate assets/anim-meta.json (pose metadata)
+    check                                            rustfmt --check + clippy + pet-model tests
 "
             );
             Ok(())
@@ -76,6 +85,17 @@ fn cargo(args: &[&str]) -> Result<()> {
         bail!("cargo {} failed ({status})", args.join(" "));
     }
     Ok(())
+}
+
+/// The local Linux decoder stack, checking that `build-ffmpeg` has run.
+fn local_ffmpeg() -> Result<PathBuf> {
+    let out = workspace_root()?.join("third_party/ffmpeg/out/linux");
+    // libvpx is installed under its own prefix (`libvpx/`), so the FFmpeg
+    // package config is what marks a finished build.
+    if !out.join("lib/pkgconfig/libavcodec.pc").is_file() {
+        bail!("{} is missing; run `cargo xtask build-ffmpeg --target linux` first", out.display());
+    }
+    Ok(out)
 }
 
 fn cargo_with_ffmpeg(out: &Path, args: &[&str]) -> Result<()> {

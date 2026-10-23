@@ -195,6 +195,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "anim-meta"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "ffmpeg-next",
+ "pet-config",
+ "pet-decode",
+ "pet-model",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,19 @@
+[package]
+name = "anim-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
+ffmpeg-next.workspace = true
+pet-config.workspace = true
+pet-decode.workspace = true
+pet-model.workspace = true
+
+[lints]
+workspace = true

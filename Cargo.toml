@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "xtask"]
+members = ["crates/*", "apps/*", "xtask", "tools/anim-meta"]
 default-members = ["crates/*", "apps/whale-pet", "xtask"]
 
 # whale-pet needs one thing egui-winit cannot do upstream: create a transparent
