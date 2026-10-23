@@ -33,6 +33,9 @@ struct Decoded {
     frame: RgbaFrame,
     /// Presentation time relative to the start of the clip.
     due: Duration,
+    /// Clip duration known from the container (`None` before the header is
+    /// read, or when the container does not declare one).
+    duration: Option<Duration>,
 }
 
 /// A clip being decoded and played.
@@ -41,6 +44,7 @@ pub struct Player {
     rx: mpsc::Receiver<Decoded>,
     pending: VecDeque<Decoded>,
     current: Option<RgbaFrame>,
+    duration: Option<Duration>,
     origin: Instant,
     disconnected: bool,
     seq: u64,
@@ -57,11 +61,16 @@ impl Player {
         }
         let origin = Instant::now();
         let _ = start_tx.send(origin);
-        Self { path, rx, pending: VecDeque::new(), current: None, origin, disconnected: false, seq: 0 }
+        Self { path, rx, pending: VecDeque::new(), current: None, duration: None, origin, disconnected: false, seq: 0 }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Duration declared by the container, once known.
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
     }
 
     /// Moves due frames into `current` and returns when the next frame is due.
@@ -84,6 +93,9 @@ impl Player {
         while self.pending.front().is_some_and(|frame| frame.due <= elapsed) {
             if let Some(frame) = self.pending.pop_front() {
                 self.current = Some(frame.frame);
+                if frame.duration.is_some() {
+                    self.duration = frame.duration;
+                }
                 self.seq += 1;
             }
         }
@@ -124,6 +136,19 @@ fn decode_clip(path: &Path, tx: &mpsc::Sender<Decoded>, origin: Instant) -> Resu
     let stream = input.streams().best(ffmpeg::media::Type::Video).ok_or_else(|| anyhow!("no video stream in {}", path.display()))?;
     let stream_index = stream.index();
     let time_base = stream.time_base();
+    // Container duration. WebM stores it in `duration` (time_base units); the
+    // upstream client uses it to time a walk's travel window.
+    let duration = {
+        let ticks = stream.duration();
+        if ticks > 0 {
+            let secs = ticks as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator());
+            (secs > 0.0).then(|| Duration::from_secs_f64(secs))
+        } else {
+            let us = input.duration();
+            (us > 0).then(|| Duration::from_micros(us as u64))
+        }
+    };
+    log::debug!("clip {} duration {:?}", path.display(), duration);
 
     // `from_parameters(...).decoder().video()` resolves the default `vp9`
     // decoder by codec id, which drops the alpha side stream. Only libvpx-vp9
@@ -185,7 +210,7 @@ fn decode_clip(path: &Path, tx: &mpsc::Sender<Decoded>, origin: Instant) -> Resu
             if due > elapsed + PREFETCH {
                 thread::sleep(due - elapsed - PREFETCH);
             }
-            if tx.send(Decoded { frame: RgbaFrame { width, height, pixels }, due }).is_err() {
+            if tx.send(Decoded { frame: RgbaFrame { width, height, pixels }, due, duration }).is_err() {
                 // The UI dropped the player (animation switch); stop quietly.
                 *keep_going = false;
                 return Ok(());
