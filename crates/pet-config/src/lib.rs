@@ -60,10 +60,6 @@ pub const SQ_DURATION_SECS: f32 = 0.220;
 pub const SPRING_K: f32 = 200.0;
 pub const SPRING_C: f32 = 30.0;
 
-/// Cross-fade of the two video layers on a clip switch (`transition: opacity
-/// .18s` in the web client).
-pub const CROSSFADE_SECS: f32 = 0.18;
-
 /// Subdirectory (below the asset root) that holds the `.webm` clips.
 pub const WEBM_DIR: &str = "webm";
 /// Scene configuration file inside the asset root.

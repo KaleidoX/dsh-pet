@@ -8,15 +8,16 @@
 | 路径 | 职责 |
 | --- | --- |
 | `crates/pet-config` | 解析上游 `config.jsonc`：动画池与分类、`moves`、`physics`、`animationWeights`、`font`、`pets[0]` 的 `position` 与 `fixedEnabled`；画布、命中框与运动常量；素材目录解析 |
-| `crates/pet-model` | 纯逻辑：随机链（`rollKind`）、分类权重、动画池、漫游规划、甩抛物理、释放速度估计、落地压缩、点击得分、拖动弹簧、Q 弹曲线 |
-| `crates/pet-decode` | `ffmpeg-next` 流式解码 VP9-alpha WebM，按 PTS 交付 RGBA 帧，并上报容器时长 |
-| `crates/pet-ui-core` | 与窗口系统无关的行为：动画链、解码推进、弹簧拖动、甩抛、漫游、Q 弹、命中测试、点击积分、菜单动作、浮层意图、贴图交叉淡入、重绘节奏、`--stats` 计量 |
+| `crates/pet-model` | 纯逻辑：随机链（`rollKind`）、分类权重、动画池、漫游规划、甩抛物理、释放速度估计、落地压缩、点击得分、拖动弹簧、Q 弹曲线；姿态描述子与切换代价（`describe_frame` / `pose_cost` / `pick_entry`） |
+| `crates/pet-decode` | `ffmpeg-next` 流式解码 VP9-alpha WebM，按 PTS 交付 RGBA 帧，并上报容器时长；`starting_at` 从指定帧开始播放，`decode_all` 供离线工具整段遍历 |
+| `crates/pet-ui-core` | 与窗口系统无关的行为：动画链、解码推进、弹簧拖动、甩抛、漫游、Q 弹、命中测试、点击积分、菜单动作、浮层意图、姿态匹配的关键帧硬切、重绘节奏、`--stats` 计量 |
 | `crates/pet-overlay` | 交互浮层的状态与绘制：悬浮提示、积分粒子与卡片、级联右键菜单；只依赖 egui，不依赖具体窗口系统 |
 | `crates/pet-ui-egui` | eframe 宿主：主窗口与浮层子视口、egui 事件循环、平台集成（X11 / Windows） |
 | `crates/pet-wayland` | 原生 Wayland 宿主：主 layer surface、浮层 layer surface（`Layer::Overlay`）、`wgpu`、`egui-wgpu`、`calloop`（仅 Linux） |
 | `crates/pet-win32` | Windows 全局指针读取、工作区查询与 DWM 边框关闭；唯一直接调用 Win32 的 crate |
 | `apps/whale-pet` | 二进制入口：参数解析、素材定位、宿主选择 |
-| `xtask` | `build-ffmpeg` / `run` / `check` 命令 |
+| `tools/anim-meta` | 离线姿态元数据生成器：解码全部 WebM，写 `assets/anim-meta.json`（不进 `default-members`） |
+| `xtask` | `build-ffmpeg` / `run` / `anim-meta` / `check` 命令 |
 
 依赖方向：`pet-config → pet-model → pet-decode → pet-ui-core → pet-overlay → pet-ui-egui / pet-wayland → apps/whale-pet`；`pet-win32` 只在 Windows 目标上被 `pet-ui-egui` 引用，`pet-wayland` 只在 Linux 目标上被 `apps/whale-pet` 引用。
 
@@ -43,8 +44,11 @@ libvpx 在 Windows 上不支持共享库，静态链入 `avcodec`。这些产物
 
 ```sh
 cargo xtask run      # release 构建并启动，自动设置 FFMPEG_DIR=out/linux
-cargo xtask check    # rustfmt --check + clippy -D warnings
+cargo xtask check    # rustfmt --check + clippy -D warnings + pet-model tests
+cargo xtask anim-meta   # 重新生成 dsh-pet/assets/anim-meta.json
 ```
+
+`anim-meta` 默认写到素材根（`--asset-dir` 可覆盖），106 段约 13 秒，产物约 282 KB，生成结果字节确定。
 
 `check` 不代设 `FFMPEG_DIR`，需显式提供：
 
@@ -79,7 +83,7 @@ cargo build --release -p whale-pet --target x86_64-pc-windows-gnu
 | `--no-force-x11` | 兼容性 no-op：「不强制 X11」现在已是默认行为 |
 | `-h, --help` | 帮助 |
 
-环境变量：`WHALE_PET_ASSET_DIR` 指定素材根；`WHALE_PET_REDUCE_MOTION` 非空且不为 `0` 时关闭动画切换的交叉淡入（对应 `prefers-reduced-motion`）。
+环境变量：`WHALE_PET_ASSET_DIR` 指定素材根。
 
 Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（见 5.1），初始化失败则记 warning 并
 强制 XWayland 重试——回退时会显式选中 X11，否则 winit 会再次挑中 Wayland 并以同样原因失败。
@@ -118,8 +122,34 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 其余 → 按 `weight` 抽分类动作）。`move` 抽中但无法起步（没有 move 动作，或落点越界）时退化为分类动作；
 漫游中再次掷到 `move` 则重播当前 clip，不另起一段。
 
-切换 clip 时保留上一帧贴图并做 0.18 秒交叉淡入（`CROSSFADE_SECS`），避免新 clip 首帧到达前的空白闪烁；
-`WHALE_PET_REDUCE_MOTION` 可关掉淡入，直接换图。
+切换 clip 一律硬切，没有淡入淡出。切换时机分两类：
+
+- **自然结束**（`Switch::Natural`，只从 `on_clip_end` 进入）：上一个 clip 已播到最后一帧，用它的末帧姿态在下一个 clip
+  的**入场窗口**里挑代价最低的一帧作为起点，硬切过去；改善不足 `ENTRY_MIN_GAIN`（0.005）时仍从第 0 帧开始。
+  末帧本身会先绘制一次再切换（`pending_end` 让 `on_clip_end` 推迟到下一次 `ui`），因此最后一帧不会丢；
+  额外延迟是一次 ui pass（通常几毫秒，由 `hold_since` 与 8 ms 的轮询保证不会停住），不是固定的一帧时长。
+- **用户主动触发**（`Switch::Immediate`：点击、开始拖动、松手、菜单动作、甩抛落地）：立即从第 0 帧硬切，不等待姿态。
+- 例外：漫游（`Mode::Move`）恒从第 0 帧入场，因为行进窗口按 clip 自身时间轴（`leadSec` / `tailSec`）定义，
+  从中间帧起步会让位置突跳。
+
+切换只看姿态决定**从哪一帧进入**，不改变随机链、权重或选片结果。新 clip 的解码线程在后台启动，
+第一个保留帧的 PTS 记为播放零点，因此在首帧到达前屏上继续显示旧贴图（纹理复用与 `hold_since`），
+到达后同一帧上传并绘制，没有空白帧。
+
+姿态描述子由 `cargo xtask anim-meta` 离线生成到 `assets/anim-meta.json`：
+
+- 每帧描述为 32×18 网格（每格对应 640×360 中 20×20 像素）：alpha > 32 的轮廓掩码（576 位，hex 编码）、
+  平均身体中心与头部中心（顶部 25% 高度）、脚底行、左右偏置、平均 RGB；全部整数编码，微秒时间戳，
+  输出字节确定。
+- 入场窗口 = 与第 0 帧代价 ≤ `ENTRY_EPS`（0.03）的最长连续前缀，上限 12 帧（`ENTRY_MAX_FRAMES`，0.5 s）。
+  106 段里 80 段达到上限，最短 2 帧。
+- 代价 = `0.45·(1−IoU) + 0.15·头部中心距/√2 + 0.15·身体中心距/√2 + 0.10·脚底差 + 0.05·偏置差/2 + 0.10·RGB 距/(255√3)`。
+  素材统一正面站姿与脚底线，代价对「两侧同时镜像」不变，因此转向后素材空间直接比较即可。
+
+文件缺失、版本/网格/列名不符时只记一条 warning，所有 clip 从第 0 帧进入；单个 clip 的记录不自洽
+（窗口不以第 0 帧开头、窗口长于帧数、末帧时间超出 `duration_us`）时只丢弃该 clip 并 warning，其余照常。
+生成器的写入路径与运行时加载器共用 `pet-config` 的同一套类型，生成后立即读回自检。每次切换打一条 debug 日志：
+`cut A -> B entry=j (t ms) cost c (frame 0 c0)`，主动切换记为 `cut A -> B immediate`。
 
 ### 4.2 交互
 
@@ -176,7 +206,7 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 
 ### 4.5 重绘调度
 
-按需重绘：解码下一帧到期时间；拖动中每帧重绘；甩抛、漫游、交叉淡入与 Q 弹期间每 8 ms 一次；
+按需重绘：解码下一帧到期时间；拖动中每帧重绘；甩抛、漫游与 Q 弹期间每 8 ms 一次；
 按住未拖动时每 8 ms 轮询一次以便窗口外的释放也能被处理；浮层由宿主在可见时每帧重绘并跟随宠物；
 Windows 额外固定每 16 ms 轮询全局指针（见 5.3）。
 
@@ -280,6 +310,12 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
 - 浮层固定 760×480 逻辑点：三级菜单在贴边时会夹在浮层窗口内，超长列表靠滚动查看
 - 指纹/触摸、输入法未接入；只处理鼠标左键/右键与键盘 `Ctrl+Q`（菜单打开时额外处理 Esc）
 - `--stats` 仅 Linux 实现
+- 姿态匹配只决定从哪一帧进入：没有过渡动作或形变，切换代价高的组合仍是硬切。自然结束的切换会多等一次
+  ui pass，因为末帧要先绘制一次
+- `anim-meta.json` 必须与素材一同发布；缺少它时所有切换都从第 0 帧开始（仍有硬切，没有淡入）。素材被换成更短的
+  版本而元数据未重生成时，若选中的入场帧超出新片长，该 clip 会打 warning 并退回第 0 帧重播，不会计入解码失败
+- 未验证：Windows 宿主上的实跑、小时级连续播放（解码线程与内存的长期行为），以及「素材替换但元数据未重生成」
+  的现实场景（只验证了截短片长的构造场景与单 clip 校验）
 - 没有安装包与发布流程，只能从源码构建
 - 只解码视频轨，没有音频
 - 未接入 dsh：余额、碎碎念、对话、系统通知、工作状态联动、HTTP 端点、占用锁、斜杠命令、设置页、托盘
@@ -387,3 +423,36 @@ surface 局部坐标，窗口跟随指针移动时不补发 motion，于是拖�
 - 修复后（清理掉全部探针的最终构建）：同样的慢拖 → 只有 `drag released` 与 `-> Idle`，没有 `release vx`。
 - 修复后快甩（8 步 × 20 ms 的斜向甩动）→ `release vx=1564 vy=-1794 |v|=2380`、`landing squash 0.66`。
 - X11 对照：慢拖停住不抛；斜向快甩 `release vx=1310 vy=-437 |v|=1380`。
+
+### 7.6 姿态匹配硬切
+
+生成器（`cargo xtask anim-meta`，release，106 段）：13.4 秒完成，写出 282 092 字节；两次运行的 SHA-256 一致。
+统计与计划标定吻合：入场窗口 80/106 段达到 12 帧上限、最短 2 帧、中位数 12；自然结束代价（A 末帧 → B 第 0 帧）
+p50 0.029 / p90 0.063 / p99 0.157 / max 0.204；11 130 个有序切换（不含 A→A）中 1 931 个（17.3%）跳过第 0 帧，
+跳帧时平均收益 0.008（p90 0.013）。写入后用运行时加载器读回自检通过。
+
+`Player::starting_at` 探针（106 段 × 跳过 0/1/7/11 帧，共 405 次）：首个交付帧与 `decode_all` 同索引帧**逐字节相同**；
+交付的 PTS 与 `anim-meta.json` 的 `entry[j].t` 一致；`duration()` 与容器时长一致；首帧最大延迟 12.8 ms（帧间隔 41.7 ms）。
+
+无窗口 `PetCore` 探针（headless egui pass）观察 9 次自然切换与 1 次主动切换：
+
+- 每次自然切换前最后一个上传的贴图都是上一段的**解码末帧**（按索引比对，非近似），`pending_end` 的延迟生效；
+- `是啊，吃什么 -> 余额-数金皱眉` 打出 `entry=8 (333 ms) cost 0.017 (frame 0 0.039)`，而新 clip 第一个上传的贴图
+  正是解码第 8 帧——选帧结果确实落到了解码器；
+- `overlay_action` 在 clip 播放中触发，7 ms 内上传并绘制目标 clip 第 0 帧。
+
+真机 X11（`--force-x11`）与原生 Wayland 各跑一次，`RUST_LOG=pet_ui_core=debug`：两条路径都观测到
+`cut A -> B entry=8 (333 ms) cost 0.017 (frame 0 0.039)`，随后 `produced its first frame after 6–30 ms`（无空白帧）；
+把待机池限制到高收益组合后，X11 与 Wayland 各自然切换 11 次，其中 3 次跳帧，跳帧率与生成器统计同量级。
+主动切换（菜单 `PlayOnce`）打出 `cut A -> B immediate` 并立即换图。
+
+降级：临时移走 `anim-meta.json` 后启动，只出现一条
+`anim-meta.json: No such file or directory ...; animations enter at frame 0`，之后每次切换都是
+`cut A -> B at frame 0`，硬切照常、无空白帧。把一个 clip 的 `entry[0].t` 改成非零后启动，只丢弃该 clip
+（`dropping clip "是啊，吃什么": entry window starts at 41700 us, not frame 0`），其余 clip 的姿态匹配照常。
+
+元数据漂移（无窗口 `PetCore` 探针，临时素材目录）：把 `余额-数金皱眉` 截成 3 帧而元数据仍是 241 帧，自然切换选中
+`entry=8` 后解码线程零帧交付，打出 `delivered no frame from entry 8; replaying from frame 0` 并以 `immediate`
+重播，25 ms 后首帧到达，未计入连续解码失败。
+
+`cargo xtask check`（rustfmt + clippy `-D warnings`，覆盖 `tools/anim-meta`，并跑 `pet-model` 的 4 项 lib 测试）通过。

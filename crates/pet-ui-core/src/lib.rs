@@ -36,14 +36,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use egui::{Color32, Pos2, Rect, TextureOptions, Vec2};
 use pet_config::{
-    BOTTOM_PAD, CANVAS_H, CANVAS_W, CROSSFADE_SECS, DRAG_THRESHOLD, HIT_BOX, PetConfig, Position, SQ_DURATION_SECS, SQ_SQUASH, WORLD_SCALE,
-    WorldArea, clip_path,
+    AnimMeta, BOTTOM_PAD, CANVAS_H, CANVAS_W, DRAG_THRESHOLD, HIT_BOX, PetConfig, Position, SQ_DURATION_SECS, SQ_SQUASH, WORLD_SCALE, WorldArea,
+    clip_path,
 };
 use pet_decode::Player;
 use pet_model::{
-    AnimPools, DragSample, Facing, MovePlan, RollKind, RollWeights, SCORE_MIN_SPEED, Spring2, ThrowParams, ThrowState, click_score,
-    estimate_release_velocity, is_no_mirror, landing_squash, move_x, pick_category_action, plan_move, roll_kind, squash_scale, throw_bounds,
-    throw_step, trim_trail,
+    AnimPools, DragSample, ENTRY_MIN_GAIN, Facing, MovePlan, RollKind, RollWeights, SCORE_MIN_SPEED, Spring2, ThrowParams, ThrowState, click_score,
+    estimate_release_velocity, is_no_mirror, landing_squash, move_x, pick_category_action, plan_move, pose_cost, roll_kind, squash_scale,
+    throw_bounds, throw_step, trim_trail,
 };
 
 /// Clip duration used when the container does not declare one (`10.09` upstream).
@@ -145,6 +145,20 @@ enum Mode {
     Drag,
 }
 
+/// How a clip switch picks its entry frame.
+///
+/// A natural switch happens when the current clip reached its end, so the last
+/// frame is on screen and the next clip can be entered at the frame that best
+/// matches it. Every other switch is a reaction to the user and cuts to frame 0
+/// immediately: waiting for a pose would delay the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    /// The previous clip ended naturally; its last frame is on screen.
+    Natural,
+    /// Respond now; no pose to match against, enter at frame 0.
+    Immediate,
+}
+
 /// A pointer press that has not been released yet.
 #[derive(Debug, Clone, Copy)]
 struct Press {
@@ -196,11 +210,17 @@ pub struct PetCore {
     stalled: bool,
     /// Bumped on every clip switch, so texture uploads can tell clips apart.
     play_gen: u64,
+    /// Frame the current clip was entered at. Only matters when the decoder
+    /// delivers nothing: the file on disk is then shorter than the metadata
+    /// that named this frame, so the clip is replayed from frame 0.
+    entry_index: usize,
     texture: Option<egui::TextureHandle>,
-    /// Previous clip's last frame, cross-faded out over `CROSSFADE_SECS`.
-    prev_texture: Option<egui::TextureHandle>,
-    fade_at: Option<Instant>,
     texture_key: Option<(u64, u64)>,
+    /// Offline pose descriptors; `None` when `anim-meta.json` is missing.
+    anim_meta: Option<AnimMeta>,
+    /// The clip's final frame was painted last pass; settle the clip on the
+    /// next pass so that frame is actually seen.
+    pending_end: bool,
     /// When the current clip was first seen without a frame while a previous
     /// texture was on screen: the pet keeps showing that texture until the new
     /// clip's first frame arrives (logged when it does).
@@ -243,6 +263,7 @@ impl PetCore {
         let pools = AnimPools::from_config(config);
         let clip_name = pools.first_idle().ok_or_else(|| anyhow!("no idle animation available"))?;
         let player = Player::new(clip_path(&asset_dir, &clip_name));
+        let anim_meta = AnimMeta::load(&asset_dir);
         let now = Instant::now();
 
         Ok(Self {
@@ -262,10 +283,11 @@ impl PetCore {
             failed_clips: 0,
             stalled: false,
             play_gen: 0,
+            entry_index: 0,
             texture: None,
-            prev_texture: None,
-            fade_at: None,
             texture_key: None,
+            anim_meta,
+            pending_end: false,
             hold_since: None,
             clip_started: None,
             next_due: None,
@@ -325,40 +347,93 @@ impl PetCore {
     // -----------------------------------------------------------------------
     // Playback.
 
-    /// Clip switch used for every transition. The previous texture is kept for
-    /// the cross-fade, exactly like the two stacked `<video>` elements upstream.
-    fn play(&mut self, name: String, mode: Mode, now: Instant) {
+    /// Clip switch used for every transition.
+    ///
+    /// With [`Switch::Natural`] the clip that just ended left its last frame on
+    /// screen, so the new clip is entered at the entry-window frame whose pose
+    /// matches it best; [`Switch::Immediate`] always enters at frame 0. Either
+    /// way the decoder starts in the background and the old texture stays on
+    /// screen until the new clip's first frame lands.
+    fn play(&mut self, name: String, mode: Mode, switch: Switch) {
         self.play_gen += 1;
-        self.prev_texture = self.texture.take();
-        self.fade_at = Some(now);
-        self.player = Player::new(clip_path(&self.asset_dir, &name));
+        let entry = self.entry_frame(&name, mode, switch);
+        if entry.0 > 0 {
+            log::debug!("cut {} -> {name} entry={} ({:.0} ms) cost {:.3} (frame 0 {:.3})", self.clip_name, entry.0, entry.1, entry.2, entry.3);
+        } else {
+            // Frame 0 for every other case: a reaction (immediate), a walk, an
+            // empty window, or no metadata at all.
+            let latest = self.pending_last_t();
+            match (switch, latest) {
+                (Switch::Natural, Some(t)) => log::debug!("cut {} -> {name} at frame 0; last frame t={} ms", self.clip_name, t / 1000),
+                (Switch::Natural, None) => log::debug!("cut {} -> {name} at frame 0", self.clip_name),
+                (Switch::Immediate, _) => log::debug!("cut {} -> {name} immediate", self.clip_name),
+            }
+        }
+        self.player = if entry.0 > 0 {
+            Player::starting_at(clip_path(&self.asset_dir, &name), entry.0)
+        } else {
+            Player::new(clip_path(&self.asset_dir, &name))
+        };
+        self.entry_index = entry.0;
         self.clip_name = name;
         self.mode = mode;
         self.clip_done = false;
         self.clip_started = None;
         self.next_due = None;
+        self.pending_end = false;
         if mode != Mode::Click && mode != Mode::Drag {
             self.squash = None;
             self.pending_squash = false;
         }
     }
 
-    fn play_once(&mut self, name: String, mode: Mode, now: Instant) {
+    /// The outgoing clip's last-frame timestamp in microseconds, when the
+    /// metadata has it.
+    fn pending_last_t(&self) -> Option<u32> {
+        self.anim_meta.as_ref().and_then(|meta| meta.clips.get(&self.clip_name)).map(|clip| clip.last.t)
+    }
+
+    /// The entry frame for `name`: index, its timestamp, its cost and frame 0's
+    /// cost. All zero when the clip is entered at frame 0.
+    ///
+    /// A walk always enters at frame 0: its travel window is defined on the
+    /// clip's own timeline (`leadSec` / `tailSec`), so starting mid-clip would
+    /// warp the pet to wherever that much time into the walk places it.
+    fn entry_frame(&self, name: &str, mode: Mode, switch: Switch) -> (usize, f32, f32, f32) {
+        if switch == Switch::Immediate || mode == Mode::Move {
+            return (0, 0.0, 0.0, 0.0);
+        }
+        let Some(meta) = &self.anim_meta else { return (0, 0.0, 0.0, 0.0) };
+        // A clip that never delivered a frame has no pose on screen to match.
+        if self.clip_started.is_none() {
+            return (0, 0.0, 0.0, 0.0);
+        }
+        let (Some(last), Some(window)) = (meta.last_pose(&self.clip_name), meta.entry(name)) else { return (0, 0.0, 0.0, 0.0) };
+        let index = pet_model::pick_entry(last, window, ENTRY_MIN_GAIN);
+        if index == 0 {
+            return (0, 0.0, 0.0, 0.0);
+        }
+        let cost = pose_cost(last, &window[index].pose);
+        let first = pose_cost(last, &window[0].pose);
+        (index, window[index].t as f32 / 1000.0, cost, first)
+    }
+
+    fn play_once(&mut self, name: String, mode: Mode, switch: Switch) {
         log::debug!("-> {mode:?} {name}");
-        self.play(name, mode, now);
+        self.play(name, mode, switch);
     }
 
     /// One idle clip (upstream `playOnce(pick(idle, anim))`), after which the
     /// clip-end handler moves on to the random chain.
-    fn play_idle_once(&mut self, now: Instant) {
+    fn play_idle_once(&mut self, switch: Switch) {
         match self.pools.pick_idle(Some(&self.clip_name)) {
-            Some(name) => self.play_once(name, Mode::Idle, now),
-            None => self.pick_next(now),
+            Some(name) => self.play_once(name, Mode::Idle, switch),
+            None => self.pick_next(switch),
         }
     }
 
     /// The random chain (`playIdle` upstream).
-    fn pick_next(&mut self, now: Instant) {
+    fn pick_next(&mut self, switch: Switch) {
         self.stop_move();
         let roll = pet_model::random_unit();
         let current = self.clip_name.clone();
@@ -366,7 +441,7 @@ impl PetCore {
         log::debug!("roll {roll:.3} -> {kind:?}");
         match kind {
             RollKind::Idle => match self.pools.pick_idle(Some(&current)) {
-                Some(name) => self.play_once(name, Mode::Idle, now),
+                Some(name) => self.play_once(name, Mode::Idle, switch),
                 None => self.stall(),
             },
             RollKind::Turn => {
@@ -374,26 +449,26 @@ impl PetCore {
                 // an empty config (the idle pool has built-in defaults).
                 let name = self.pools.pick_turn(Some(&current)).or_else(|| self.pools.pick_idle(Some(&current)));
                 match name {
-                    Some(name) => self.play_once(name, Mode::Turn, now),
+                    Some(name) => self.play_once(name, Mode::Turn, switch),
                     None => self.stall(),
                 }
             }
-            RollKind::Move => match self.try_move(None, now) {
+            RollKind::Move => match self.try_move(None, switch) {
                 TryMove::Started(_) => {}
                 // A walk or throw already owns the position: replay the clip
                 // already on screen, never load a nonexistent one.
                 TryMove::Busy => {
                     let replay = self.clip_name.clone();
                     let mode = self.mode;
-                    self.play_once(replay, mode, now);
+                    self.play_once(replay, mode, switch);
                 }
                 TryMove::Unavailable => match pick_category_action(self.pools.categories(), self.pools.idle_pool(), self.facing, Some(&current)) {
-                    Some((_, name)) => self.play_once(name, Mode::Action, now),
+                    Some((_, name)) => self.play_once(name, Mode::Action, switch),
                     None => self.stall(),
                 },
             },
             RollKind::Action => match pick_category_action(self.pools.categories(), self.pools.idle_pool(), self.facing, Some(&current)) {
-                Some((_, name)) => self.play_once(name, Mode::Action, now),
+                Some((_, name)) => self.play_once(name, Mode::Action, switch),
                 None => self.stall(),
             },
         }
@@ -404,22 +479,22 @@ impl PetCore {
         self.stalled = true;
     }
 
-    fn play_drag(&mut self, now: Instant) {
+    fn play_drag(&mut self) {
         if let Some(name) = self.pools.pick_drag() {
-            self.play_once(name, Mode::Drag, now);
+            self.play_once(name, Mode::Drag, Switch::Immediate);
         }
     }
 
-    fn play_click(&mut self, now: Instant) {
+    fn play_click(&mut self) {
         if let Some(name) = self.pools.pick_click() {
-            self.play_once(name, Mode::Click, now);
+            self.play_once(name, Mode::Click, Switch::Immediate);
             self.squash = None;
             self.pending_squash = true;
         }
     }
 
     /// Starts a walk towards a random or named move animation.
-    fn try_move(&mut self, preferred: Option<&str>, now: Instant) -> TryMove {
+    fn try_move(&mut self, preferred: Option<&str>, switch: Switch) -> TryMove {
         if self.move_plan.is_some() || self.throw.is_some() {
             return TryMove::Busy;
         }
@@ -430,7 +505,7 @@ impl PetCore {
         let cy = self.pos.1 + CANVAS_H as f32 / 2.0;
         let Some(plan) = plan_move(cx, cy, self.facing, params, self.world) else { return TryMove::Unavailable };
         self.move_plan = Some((plan, name.clone()));
-        self.play_once(name.clone(), Mode::Move, now);
+        self.play_once(name.clone(), Mode::Move, switch);
         TryMove::Started(name)
     }
 
@@ -461,6 +536,10 @@ impl PetCore {
     // Decoder and clip-end dispatch.
 
     /// Decoder ticks, clip-end handling and squash starts.
+    ///
+    /// Runs before [`Self::paint`] in [`Self::ui`]: a frame that arrives in the
+    /// same pass as the end of the clip is held by `pending_end` and painted
+    /// first, so the last frame is actually on screen before the switch.
     fn advance_clip(&mut self, ctx: &egui::Context, now: Instant) {
         let before = self.player.seq();
         self.next_due = self.player.advance(now);
@@ -477,16 +556,36 @@ impl PetCore {
                 ctx.request_repaint();
             }
         }
-        if self.player.ended() && !self.clip_done {
-            self.on_clip_end(now);
+        if self.pending_end && !advanced {
+            // The last frame of the finished clip has been painted; switch now.
+            self.pending_end = false;
+            self.on_clip_end();
+        } else if self.player.ended() && !self.clip_done && !self.pending_end {
+            // A frame that arrives together with the end is painted first: the
+            // switch waits for the next ui pass so the final frame is visible
+            // (and matches the `last` descriptor in the metadata).
+            self.pending_end = true;
+            ctx.request_repaint();
         }
     }
 
-    fn on_clip_end(&mut self, now: Instant) {
+    fn on_clip_end(&mut self) {
         self.clip_done = true;
         let produced = self.player.seq() > 0;
         if produced {
             self.failed_clips = 0;
+        } else if self.entry_index > 0 {
+            // The metadata named a frame this file does not have: the clip is
+            // shorter than when `anim-meta.json` was generated. Retrying from
+            // frame 0 always delivers frames (or fails like any other clip),
+            // instead of counting a metadata drift as a decode failure and
+            // eventually stopping playback for good.
+            log::warn!("clip {} delivered no frame from entry {}; replaying from frame 0", self.clip_name, self.entry_index);
+            let name = self.clip_name.clone();
+            let mode = self.mode;
+            // Frame 0 by construction: the clip has no pose on screen to match.
+            self.play(name, mode, Switch::Immediate);
+            return;
         } else {
             self.failed_clips += 1;
             log::warn!("clip {} produced no frames", self.clip_name);
@@ -510,10 +609,10 @@ impl PetCore {
         }
         // Interaction clips go back to idle without entering the chain first.
         if matches!(self.mode, Mode::Click | Mode::Drag) {
-            self.play_idle_once(now);
+            self.play_idle_once(Switch::Natural);
             return;
         }
-        self.pick_next(now);
+        self.pick_next(Switch::Natural);
     }
 
     // -----------------------------------------------------------------------
@@ -588,7 +687,7 @@ impl PetCore {
             // The pet is lifted by the stage pad while held; the spring starts
             // from the current window position.
             press.spring = Some(Spring2::new(self.pos.0, self.pos.1));
-            self.play_drag(input.now);
+            self.play_drag();
         }
 
         let (gx, gy) = self.pointer_global(local, input);
@@ -613,7 +712,7 @@ impl PetCore {
                 self.stop_throw();
                 self.stop_move();
             } else {
-                self.play_click(input.now);
+                self.play_click();
             }
         }
 
@@ -642,7 +741,7 @@ impl PetCore {
         self.pos = (self.pos.0.round(), self.pos.1.round());
         self.commit_center();
         // Upstream returns to an idle clip before deciding whether to throw.
-        self.play_idle_once(now);
+        self.play_idle_once(Switch::Immediate);
         let trail = std::mem::take(&mut self.trail);
         let now_ms = now.duration_since(self.epoch).as_secs_f64() * 1000.0;
         match estimate_release_velocity(&trail, now_ms, self.physics) {
@@ -752,7 +851,7 @@ impl PetCore {
             self.throw = None;
             self.was_grounded = false;
             self.commit_center();
-            self.pick_next(now);
+            self.pick_next(Switch::Immediate);
         }
     }
 
@@ -806,19 +905,6 @@ impl PetCore {
             self.hold_since.get_or_insert(now);
         }
 
-        let fresh = self.texture.is_some();
-        let mut fade = match (self.fade_at, fresh) {
-            (Some(start), true) if !reduce_motion() => ((now - start).as_secs_f32() / CROSSFADE_SECS).clamp(0.0, 1.0),
-            (Some(_), true) => 1.0,
-            _ => 0.0,
-        };
-        if fade >= 1.0 {
-            self.fade_at = None;
-            self.prev_texture = None;
-            fade = 1.0;
-        }
-        let old = if self.fade_at.is_some() { self.prev_texture.as_ref() } else { None };
-
         let scale = match self.squash {
             Some((start, squash)) => squash_scale((now - start).as_secs_f32() / SQ_DURATION_SECS, squash),
             None => 1.0,
@@ -838,18 +924,8 @@ impl PetCore {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
         };
         let painter = ui.painter();
-        match (old, &self.texture) {
-            (Some(old), Some(current)) => {
-                painter.image(old.id(), rect, uv, Color32::from_white_alpha(((1.0 - fade) * 255.0).round() as u8));
-                painter.image(current.id(), rect, uv, Color32::from_white_alpha((fade * 255.0).round() as u8));
-            }
-            (Some(old), None) => {
-                painter.image(old.id(), rect, uv, Color32::WHITE);
-            }
-            (None, Some(current)) => {
-                painter.image(current.id(), rect, uv, Color32::WHITE);
-            }
-            (None, None) => {}
+        if let Some(current) = &self.texture {
+            painter.image(current.id(), rect, uv, Color32::WHITE);
         }
     }
 
@@ -861,9 +937,6 @@ impl PetCore {
             } else {
                 ctx.request_repaint_after(Duration::from_millis(8));
             }
-        }
-        if self.fade_at.is_some() && !reduce_motion() {
-            ctx.request_repaint_after(Duration::from_millis(8));
         }
         // Windows has to poll the global cursor to decide whether the window is
         // click-through, and a click-through window receives no events that could
@@ -922,12 +995,12 @@ impl PetCore {
                     self.facing = Facing::Left;
                 }
                 self.stop_move();
-                self.play_once(name, Mode::Action, Instant::now());
+                self.play_once(name, Mode::Action, Switch::Immediate);
             }
             OverlayAction::MoveTo(name) => {
                 self.menu_open = false;
-                if self.try_move(Some(&name), Instant::now()) == TryMove::Unavailable {
-                    self.play_once(name, Mode::Action, Instant::now());
+                if self.try_move(Some(&name), Switch::Immediate) == TryMove::Unavailable {
+                    self.play_once(name, Mode::Action, Switch::Immediate);
                 }
             }
             OverlayAction::Home => {
@@ -962,10 +1035,6 @@ impl PetCore {
     pub fn logical_size(ppp: f32) -> (f32, f32) {
         (CANVAS_W as f32 / ppp, CANVAS_H as f32 / ppp)
     }
-}
-
-fn reduce_motion() -> bool {
-    std::env::var_os("WHALE_PET_REDUCE_MOTION").is_some_and(|value| value != "0")
 }
 
 /// Top-left of a `CANVAS_W * CANVAS_H` window placed at `corner` with the given
