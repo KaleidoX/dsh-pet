@@ -38,6 +38,8 @@ mod ffi;
 #[cfg(target_os = "linux")]
 mod input;
 #[cfg(target_os = "linux")]
+mod overlay;
+#[cfg(target_os = "linux")]
 mod surface;
 #[cfg(target_os = "linux")]
 mod wgpu;

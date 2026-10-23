@@ -38,6 +38,15 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
+    /// Pins the surface to the output's top-left corner.
+    ///
+    /// Used by the overlay window, whose position is always computed rather than
+    /// configured: with only `TOP | LEFT` anchored, [`Self::set_local_origin`]
+    /// writes exactly the two margins that place it.
+    pub(crate) fn top_left() -> Self {
+        Self { anchor: Anchor::TOP | Anchor::LEFT, left: 0, right: 0, top: 0, bottom: 0 }
+    }
+
     /// The corner and margins from the config file.
     ///
     /// Exactly one horizontal and one vertical edge is anchored per corner, so
@@ -123,6 +132,25 @@ pub(crate) fn set_hit_region(compositor: &CompositorState, layer: &LayerSurface,
     let x1 = (HIT_BOX.x1 as f32 / ppp).round() as i32;
     let y1 = (HIT_BOX.y1 as f32 / ppp).round() as i32;
     region.add(x0, y0, (x1 - x0).max(1), (y1 - y0).max(1));
+    layer.set_input_region(Some(region.wl_region()));
+    Ok(())
+}
+
+/// Sets the overlay surface's input region: empty while it is click-through, or
+/// the whole surface while the menu is open.
+///
+/// An empty region is the protocol's way of saying "no input at all" — a null
+/// region would mean the opposite (infinite), so one is always created and left
+/// empty in the click-through case. The surface keeps being drawn, which is
+/// what the tooltip and the score card need. The overlay is a separate surface
+/// from the pet, so this never affects the pet's own hit box.
+///
+/// Callers commit: the region is double-buffered.
+pub(crate) fn set_overlay_region(compositor: &CompositorState, layer: &LayerSurface, size: (u32, u32), interactive: bool) -> Result<()> {
+    let region = Region::new(compositor)?;
+    if interactive {
+        region.add(0, 0, size.0.max(1) as i32, size.1.max(1) as i32);
+    }
     layer.set_input_region(Some(region.wl_region()));
     Ok(())
 }

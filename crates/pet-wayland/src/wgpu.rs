@@ -12,26 +12,29 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
-use pet_config::{CANVAS_H, CANVAS_W};
 use wayland_client::Connection;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wgpu::{
-    CompositeAlphaMode, Device, Instance, InstanceDescriptor, PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor, Surface,
+    Adapter, CompositeAlphaMode, Device, Instance, InstanceDescriptor, PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor, Surface,
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages,
 };
 
 /// Everything needed to turn egui's tessellated output into a frame.
+///
+/// One instance backs both of the app's surfaces (the pet and the interaction
+/// overlay): [`Self::sibling`] builds the second renderer on the same device and
+/// queue, so the two windows share a GPU context and always agree on format.
 pub(crate) struct Wgpu {
     /// Declared before `instance`: fields drop in declaration order, so the
     /// surface is torn down while the instance that created it is still alive.
     /// The raw `wl_surface`/`wl_display` it points into are owned by
     /// `WaylandApp`, which drops its `Wgpu` before both.
     surface: Surface<'static>,
-    /// Held for teardown order and for backends that keep per-instance state:
-    /// wgpu's `Surface` only borrows the instance context, and the display
-    /// handle passed at creation points into the Wayland connection.
-    #[allow(dead_code)]
+    /// Kept for [`Self::sibling`], which creates the second surface from it.
     instance: Instance,
+    /// Kept for [`Self::sibling`]: capabilities must be asked of the adapter
+    /// the first surface was accepted by.
+    adapter: Adapter,
     device: Device,
     queue: Queue,
     renderer: Renderer,
@@ -40,32 +43,38 @@ pub(crate) struct Wgpu {
 }
 
 impl Wgpu {
-    /// Creates the surface and the renderer for `wl_surface`.
+    /// Creates the surface and the renderer for `wl_surface`, with a swapchain
+    /// of `size` physical pixels.
     ///
     /// `wl_surface` and the connection it came from must outlive the returned
     /// value; `WaylandApp` declares the `gpu` field before the `LayerSurface`
     /// and its last `Connection` clone to guarantee that.
-    pub(crate) fn new(conn: &Connection, wl_surface: &WlSurface) -> Result<Self> {
+    pub(crate) fn new(conn: &Connection, wl_surface: &WlSurface, size: (u32, u32)) -> Result<Self> {
         let display = crate::ffi::DisplayPtr::new(conn)?;
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(display)));
-
-        let raw_window_handle = crate::ffi::window_handle(wl_surface)?;
-        // SAFETY: `raw_window_handle` points at a live `wl_surface`, and the
-        // instance carries the `wl_display` those handles belong to; wgpu
-        // requires them to be identical, and both come from `conn`. The surface
-        // is declared before the wgpu objects in `WaylandApp`, so it outlives
-        // them.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(SurfaceTargetUnsafe::RawHandle { raw_display_handle: None, raw_window_handle })
-                .context("create a wgpu surface for the layer surface")?
-        };
+        let surface = create_surface(&instance, wl_surface)?;
 
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() }))
                 .context("no Vulkan or GLES adapter accepts the layer surface")?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).context("request a wgpu device")?;
 
+        let wgpu = Self::assemble(instance, surface, adapter, device, queue, size)?;
+        log::info!("wgpu on Wayland: {:?} adapter, {:?}, {:?} alpha", wgpu.adapter.get_info().backend, wgpu.format, wgpu.config.alpha_mode);
+        Ok(wgpu)
+    }
+
+    /// A renderer for a second surface, sharing this one's device and queue.
+    ///
+    /// The overlay window is a separate `wl_surface`; giving it the same device
+    /// avoids a second adapter request and guarantees the two swapchains use
+    /// one format and alpha mode.
+    pub(crate) fn sibling(&self, wl_surface: &WlSurface, size: (u32, u32)) -> Result<Self> {
+        let surface = create_surface(&self.instance, wl_surface)?;
+        Self::assemble(self.instance.clone(), surface, self.adapter.clone(), self.device.clone(), self.queue.clone(), size)
+    }
+
+    fn assemble(instance: Instance, surface: Surface<'static>, adapter: Adapter, device: Device, queue: Queue, size: (u32, u32)) -> Result<Self> {
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
@@ -81,8 +90,8 @@ impl Wgpu {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
-            width: CANVAS_W,
-            height: CANVAS_H,
+            width: size.0.max(1),
+            height: size.1.max(1),
             present_mode: PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode,
@@ -90,10 +99,19 @@ impl Wgpu {
         };
         surface.configure(&device, &config);
         let renderer = Renderer::new(&device, format, RendererOptions::default());
+        Ok(Self { surface, instance, adapter, device, queue, renderer, format, config })
+    }
 
-        log::info!("wgpu on Wayland: {:?} adapter, {format:?}, {alpha_mode:?} alpha, formats {:?}", adapter.get_info().backend, caps.formats.len());
-
-        Ok(Self { surface, instance, device, queue, renderer, format, config })
+    /// Reallocates the swapchain when the scale changes.
+    pub(crate) fn resize(&mut self, size: (u32, u32)) {
+        let size = (size.0.max(1), size.1.max(1));
+        if self.config.width == size.0 && self.config.height == size.1 {
+            return;
+        }
+        log::debug!("swapchain {}x{} -> {}x{}", self.config.width, self.config.height, size.0, size.1);
+        self.config.width = size.0;
+        self.config.height = size.1;
+        self.surface.configure(&self.device, &self.config);
     }
 
     /// Renders one egui frame and presents it.
@@ -206,5 +224,20 @@ fn pick_alpha_mode(modes: &[CompositeAlphaMode]) -> CompositeAlphaMode {
     } else {
         log::warn!("the surface offers no alpha-capable composite mode; the pet will have an opaque background");
         modes.first().copied().unwrap_or(CompositeAlphaMode::Opaque)
+    }
+}
+
+/// Builds a wgpu surface for a live `wl_surface`.
+fn create_surface(instance: &Instance, wl_surface: &WlSurface) -> Result<Surface<'static>> {
+    let raw_window_handle = crate::ffi::window_handle(wl_surface)?;
+    // SAFETY: `raw_window_handle` points at a live `wl_surface`, and the
+    // instance carries the `wl_display` those handles belong to; wgpu requires
+    // them to be identical, and both ultimately come from the same `Connection`.
+    // The surface is declared before the wgpu objects in `WaylandApp`, so the
+    // `wl_surface` outlives them.
+    unsafe {
+        instance
+            .create_surface_unsafe(SurfaceTargetUnsafe::RawHandle { raw_display_handle: None, raw_window_handle })
+            .context("create a wgpu surface for the layer surface")
     }
 }

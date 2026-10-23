@@ -24,6 +24,7 @@ pet-model = { path = "crates/pet-model" }
 pet-decode = { path = "crates/pet-decode" }
 pet-ui-core = { path = "crates/pet-ui-core" }
 pet-ui-egui = { path = "crates/pet-ui-egui" }
+pet-overlay = { path = "crates/pet-overlay" }
 pet-wayland = { path = "crates/pet-wayland" }
 
 # 外部依赖（版本与实测锁定，见 .agents/findings.md 第 10、11 节）

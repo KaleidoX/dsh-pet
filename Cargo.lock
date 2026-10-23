@@ -2722,6 +2722,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pet-overlay"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "fastrand",
+ "log",
+ "pet-config",
+ "pet-ui-core",
+]
+
+[[package]]
 name = "pet-ui-core"
 version = "0.1.0"
 dependencies = [
@@ -2745,6 +2756,7 @@ dependencies = [
  "pet-config",
  "pet-decode",
  "pet-model",
+ "pet-overlay",
  "pet-ui-core",
  "pet-win32",
  "winit",
@@ -2762,6 +2774,7 @@ dependencies = [
  "egui-wgpu",
  "log",
  "pet-config",
+ "pet-overlay",
  "pet-ui-core",
  "pollster",
  "raw-window-handle",

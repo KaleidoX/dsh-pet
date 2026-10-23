@@ -15,7 +15,7 @@ use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use winit::window::Window;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
-use x11rb::protocol::xproto::{ClipOrdering, ConnectionExt as _, KeyButMask, Rectangle};
+use x11rb::protocol::xproto::{Atom, AtomEnum, ClipOrdering, ConnectionExt as _, KeyButMask, Rectangle};
 use x11rb::rust_connection::RustConnection;
 
 pub(crate) struct X11 {
@@ -53,5 +53,47 @@ impl X11 {
         let reply = self.conn.query_pointer(self.root)?.reply().context("query the pointer")?;
         let down = u16::from(reply.mask) & u16::from(KeyButMask::BUTTON1) != 0;
         Ok((i32::from(reply.root_x), i32::from(reply.root_y), down))
+    }
+
+    /// Work area of the current desktop (`_NET_WORKAREA`), or the whole root
+    /// window when the window manager does not publish one.
+    ///
+    /// The property holds four CARDINALs per desktop: x, y, width, height. On a
+    /// multi-monitor desktop it is the union of the monitors minus panels, which
+    /// is exactly the space the pet is allowed to roam in.
+    pub(crate) fn work_area(&self) -> Result<(i32, i32, u32, u32)> {
+        let desktop = self.cardinal(self.root, "_NET_CURRENT_DESKTOP").unwrap_or(0);
+        if let Some(values) = self.cardinals(self.root, "_NET_WORKAREA") {
+            let base = desktop as usize * 4;
+            if values.len() >= base + 4 {
+                let (x, y, w, h) = (values[base], values[base + 1], values[base + 2], values[base + 3]);
+                if w > 0 && h > 0 {
+                    return Ok((x as i32, y as i32, w, h));
+                }
+            }
+        }
+        let geometry = self.conn.get_geometry(self.root)?.reply().context("read the root geometry")?;
+        Ok((0, 0, u32::from(geometry.width), u32::from(geometry.height)))
+    }
+
+    fn atom(&self, name: &str) -> Option<Atom> {
+        Some(self.conn.intern_atom(false, name.as_bytes()).ok()?.reply().ok()?.atom)
+    }
+
+    fn property(&self, window: u32, name: &str) -> Option<Vec<u32>> {
+        let atom = self.atom(name)?;
+        let reply = self.conn.get_property(false, window, atom, AtomEnum::CARDINAL, 0, u32::MAX).ok()?.reply().ok()?;
+        if reply.format != 32 {
+            return None;
+        }
+        Some(reply.value32().map(Iterator::collect).unwrap_or_default())
+    }
+
+    fn cardinal(&self, window: u32, name: &str) -> Option<u32> {
+        self.property(window, name)?.first().copied()
+    }
+
+    fn cardinals(&self, window: u32, name: &str) -> Option<Vec<u32>> {
+        self.property(window, name)
     }
 }
