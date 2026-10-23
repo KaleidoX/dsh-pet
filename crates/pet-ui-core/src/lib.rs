@@ -41,9 +41,9 @@ use pet_config::{
 };
 use pet_decode::Player;
 use pet_model::{
-    AnimPools, DragSample, ENTRY_MIN_GAIN, Facing, MovePlan, RollKind, RollWeights, SCORE_MIN_SPEED, Spring2, ThrowParams, ThrowState, click_score,
-    estimate_release_velocity, is_no_mirror, landing_squash, move_x, pick_category_action, plan_move, pose_cost, roll_kind, squash_scale,
-    throw_bounds, throw_step, trim_trail,
+    AnimPools, DragSample, ENTRY_MIN_GAIN, Facing, MovePlan, RollKind, RollWeights, SCORE_MIN_SPEED, Spring2, ThrowParams, ThrowSimulation,
+    ThrowState, click_score, estimate_release_velocity, is_no_mirror, landing_squash, move_x, pick_category_action, plan_move, pose_cost, roll_kind,
+    squash_scale, throw_bounds, trim_trail,
 };
 
 /// Clip duration used when the container does not declare one (`10.09` upstream).
@@ -247,9 +247,8 @@ pub struct PetCore {
     /// Last window position handed to the host.
     last_reported: Option<(i32, i32)>,
     move_plan: Option<(MovePlan, String)>,
-    throw: Option<ThrowState>,
-    /// Whether the previous throw step touched the ground.
-    was_grounded: bool,
+    throw: Option<ThrowSimulation>,
+    throw_updated: Instant,
     trail: Vec<DragSample>,
     /// Clock origin for pointer samples and the release window.
     epoch: Instant,
@@ -303,7 +302,7 @@ impl PetCore {
             last_reported: None,
             move_plan: None,
             throw: None,
-            was_grounded: false,
+            throw_updated: now,
             trail: Vec::new(),
             epoch: now,
             menu_open: false,
@@ -517,7 +516,6 @@ impl PetCore {
     /// stored as the session position, so the pet does not snap back.
     fn stop_throw(&mut self) {
         if self.throw.take().is_some() {
-            self.was_grounded = false;
             self.commit_center();
         }
     }
@@ -647,6 +645,7 @@ impl PetCore {
                 // A click on the flying pet scores on press, reading the speed
                 // before the throw is stopped.
                 if let Some(state) = self.throw {
+                    let state = state.state();
                     let speed = state.vx.hypot(state.vy);
                     if speed >= SCORE_MIN_SPEED {
                         let points = click_score(speed);
@@ -747,7 +746,7 @@ impl PetCore {
         match estimate_release_velocity(&trail, now_ms, self.physics) {
             Some((vx, vy)) => {
                 log::debug!("release vx={vx:.0} vy={vy:.0} |v|={:.0}", vx.hypot(vy));
-                self.start_throw(vx, vy);
+                self.start_throw(vx, vy, now);
             }
             None => {
                 // A gentle placement: the pet stays where the spring left it.
@@ -758,10 +757,10 @@ impl PetCore {
         }
     }
 
-    fn start_throw(&mut self, vx: f32, vy: f32) {
+    fn start_throw(&mut self, vx: f32, vy: f32, now: Instant) {
         self.stop_move();
-        self.throw = Some(ThrowState { x: self.pos.0, y: self.pos.1, vx, vy });
-        self.was_grounded = false;
+        self.throw = Some(ThrowSimulation::new(ThrowState { x: self.pos.0, y: self.pos.1, vx, vy }));
+        self.throw_updated = now;
         self.pending_squash = false;
         self.squash = None;
     }
@@ -825,31 +824,24 @@ impl PetCore {
         }
     }
 
-    fn step_throw(&mut self, state: ThrowState, out: &mut FrameOutput, now: Instant) {
-        let bounds = throw_bounds(self.world);
-        let falling_vy = state.vy;
-        let step = throw_step(state, 1.0 / 60.0, bounds, self.physics);
-        self.throw = Some(step.state);
-        self.pos = (step.state.x, step.state.y);
-        let pos = (step.state.x.round() as i32, step.state.y.round() as i32);
+    fn step_throw(&mut self, mut simulation: ThrowSimulation, out: &mut FrameOutput, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.throw_updated);
+        self.throw_updated = now;
+        let frame = simulation.advance(elapsed, throw_bounds(self.world), self.physics);
+        self.throw = Some(simulation);
+        self.pos = frame.position;
+        let pos = (self.pos.0.round() as i32, self.pos.1.round() as i32);
         if self.last_reported != Some(pos) {
             out.move_to = Some(pos);
             self.last_reported = Some(pos);
         }
-
-        let grounded = step.state.y >= bounds.max_y - 1.0;
-        // Landing squash: only on the airborne-to-ground transition, scaled by
-        // the impact speed (the vertical speed before this step integrated).
-        if step.bounced && grounded && !self.was_grounded {
-            let squash = landing_squash(falling_vy);
-            log::debug!("landing squash {squash:.2} from {falling_vy:.0} px/s");
+        if let Some(speed) = frame.landing_speed {
+            let squash = landing_squash(speed);
+            log::debug!("landing squash {squash:.2} from {speed:.0} px/s");
             self.squash = Some((now, squash));
         }
-        self.was_grounded = grounded;
-
-        if step.at_rest {
+        if frame.at_rest {
             self.throw = None;
-            self.was_grounded = false;
             self.commit_center();
             self.pick_next(Switch::Immediate);
         }
@@ -954,7 +946,9 @@ impl PetCore {
             return;
         }
         if self.throw.is_some() || self.move_plan.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(8));
+            // Motion follows presentation cadence. Adding a timer after a
+            // presented frame can miss the next refresh, especially on X11.
+            ctx.request_repaint();
             return;
         }
         if let Some(due) = self.next_due {

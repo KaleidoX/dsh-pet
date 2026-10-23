@@ -440,6 +440,60 @@ pub struct ThrowStep {
     pub at_rest: bool,
 }
 
+/// A projectile clock independent of the host's redraw frequency.
+#[derive(Debug, Clone, Copy)]
+pub struct ThrowSimulation {
+    state: ThrowState,
+    previous: ThrowState,
+    pending: std::time::Duration,
+    grounded: bool,
+}
+
+pub struct ThrowFrame {
+    pub position: (f32, f32),
+    pub landing_speed: Option<f32>,
+    pub at_rest: bool,
+}
+
+impl ThrowSimulation {
+    pub fn new(state: ThrowState) -> Self {
+        Self { state, previous: state, pending: std::time::Duration::ZERO, grounded: false }
+    }
+
+    pub fn state(&self) -> ThrowState {
+        self.state
+    }
+
+    /// Integrate fixed 120 Hz steps and interpolate the displayed position.
+    /// A suspended host resumes with at most 250 ms of simulation work.
+    pub fn advance(&mut self, elapsed: std::time::Duration, bounds: ThrowBounds, params: ThrowParams) -> ThrowFrame {
+        const STEP: std::time::Duration = std::time::Duration::from_nanos(8_333_333);
+        self.pending += elapsed.min(std::time::Duration::from_millis(250));
+        let mut landing_speed = None;
+        let mut at_rest = false;
+        while self.pending >= STEP {
+            self.pending -= STEP;
+            self.previous = self.state;
+            let step = throw_step(self.state, STEP.as_secs_f32(), bounds, params);
+            self.state = step.state;
+            let grounded = self.state.y >= bounds.max_y - 1.0;
+            if step.bounced && grounded && !self.grounded {
+                landing_speed = Some(self.previous.vy);
+            }
+            self.grounded = grounded;
+            at_rest = step.at_rest;
+            if at_rest {
+                self.previous = self.state;
+                self.pending = std::time::Duration::ZERO;
+                break;
+            }
+        }
+        let alpha = self.pending.as_secs_f32() / STEP.as_secs_f32();
+        let position = (self.previous.x + (self.state.x - self.previous.x) * alpha, self.previous.y + (self.state.y - self.previous.y) * alpha);
+        ThrowFrame { position, landing_speed, at_rest }
+    }
+}
+
 /// `throwStep`: gravity, integration, then wall/ground response.
 pub fn throw_step(state: ThrowState, dt_raw: f32, bounds: ThrowBounds, params: ThrowParams) -> ThrowStep {
     let dt = dt_raw.clamp(0.0, MAX_STEP_DT);
