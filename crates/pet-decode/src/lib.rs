@@ -25,8 +25,6 @@ use ffmpeg_next as ffmpeg;
 
 /// How far ahead of the playback clock decoded frames may be queued.
 const PREFETCH: Duration = Duration::from_millis(120);
-/// Decoder threads wait this long for the UI's playback origin before giving up.
-const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One decoded frame in RGBA8, tightly packed.
 pub struct RgbaFrame {
@@ -60,7 +58,8 @@ pub struct Player {
     pending: VecDeque<Decoded>,
     current: Option<RgbaFrame>,
     duration: Option<Duration>,
-    origin: Instant,
+    origin: Option<Instant>,
+    start_tx: Option<mpsc::Sender<Instant>>,
     disconnected: bool,
     seq: u64,
 }
@@ -83,9 +82,17 @@ impl Player {
         if let Err(err) = spawn {
             log::error!("cannot spawn decoder thread: {err}");
         }
-        let origin = Instant::now();
-        let _ = start_tx.send(origin);
-        Self { path, rx, pending: VecDeque::new(), current: None, duration: None, origin, disconnected: false, seq: 0 }
+        Self {
+            path,
+            rx,
+            pending: VecDeque::new(),
+            current: None,
+            duration: None,
+            origin: None,
+            start_tx: Some(start_tx),
+            disconnected: false,
+            seq: 0,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -113,7 +120,14 @@ impl Player {
             }
         }
 
-        let elapsed = now.saturating_duration_since(self.origin);
+        if self.origin.is_none() && !self.pending.is_empty() {
+            self.origin = Some(now);
+            if let Some(tx) = self.start_tx.take() {
+                let _ = tx.send(now);
+            }
+        }
+        let elapsed = self.origin.map_or(Duration::ZERO, |origin| now.saturating_duration_since(origin));
+        let before = self.seq;
         while self.pending.front().is_some_and(|frame| frame.due <= elapsed) {
             if let Some(frame) = self.pending.pop_front() {
                 self.current = Some(frame.frame);
@@ -122,6 +136,10 @@ impl Player {
                 }
                 self.seq += 1;
             }
+        }
+        let advanced = self.seq - before;
+        if advanced > 1 {
+            log::debug!(target: "pet_decode::playback", "{} skipped {} overdue frames", self.path.display(), advanced - 1);
         }
 
         self.pending.front().map(|frame| frame.due.saturating_sub(elapsed).max(Duration::from_millis(1)))
@@ -160,23 +178,29 @@ pub fn decode_all(path: &Path, mut on_frame: impl FnMut(RgbaFrame, u64) -> bool)
 }
 
 fn decode_thread(path: PathBuf, tx: mpsc::Sender<Decoded>, start_rx: mpsc::Receiver<Instant>, skip_frames: usize) {
-    let origin = match start_rx.recv_timeout(START_TIMEOUT) {
-        Ok(origin) => origin,
-        Err(_) => return,
-    };
-    if let Err(err) = stream_clip(&path, &tx, origin, skip_frames) {
+    if let Err(err) = stream_clip(&path, &tx, &start_rx, skip_frames) {
         log::error!("decode {}: {err:#}", path.display());
     }
 }
 
-fn stream_clip(path: &Path, tx: &mpsc::Sender<Decoded>, origin: Instant, skip_frames: usize) -> Result<()> {
+fn stream_clip(path: &Path, tx: &mpsc::Sender<Decoded>, start_rx: &mpsc::Receiver<Instant>, skip_frames: usize) -> Result<()> {
     let mut base: Option<f64> = None;
+    let mut origin: Option<Instant> = None;
     walk_frames(path, skip_frames, |frame, pts, duration| {
         // The first delivered frame is the playback origin; earlier frames were
         // skipped by the walker.
         let base = *base.get_or_insert(pts);
         let due = Duration::from_secs_f64((pts - base).max(0.0));
-        let elapsed = Instant::now().saturating_duration_since(origin);
+        let Some(started) = origin else {
+            // Publish the first retained frame before starting the clock. Slow
+            // opening/decoding must not make its presentation time overdue.
+            if tx.send(Decoded { frame, due, duration }).is_err() {
+                return Ok(false);
+            }
+            origin = start_rx.recv().ok();
+            return Ok(origin.is_some());
+        };
+        let elapsed = Instant::now().saturating_duration_since(started);
         if due > elapsed + PREFETCH {
             thread::sleep(due - elapsed - PREFETCH);
         }
@@ -298,4 +322,39 @@ fn walk_frames(path: &Path, skip: usize, mut on_frame: impl FnMut(RgbaFrame, f64
     drain(&mut decoder, &mut scaler, &mut rgba, &mut frames, &mut keep_going)?;
     log::debug!("end of stream for {} ({frames} frames)", path.display());
     Ok(ClipInfo { duration, frames })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_starts_when_the_first_frame_is_consumed() {
+        let (tx, rx) = mpsc::channel();
+        let (start_tx, _start_rx) = mpsc::channel();
+        let mut player = Player {
+            path: PathBuf::from("delayed.webm"),
+            rx,
+            pending: VecDeque::new(),
+            current: None,
+            duration: None,
+            origin: None,
+            start_tx: Some(start_tx),
+            disconnected: false,
+            seq: 0,
+        };
+        for (pixel, millis) in [(1, 0), (2, 40)] {
+            tx.send(Decoded { frame: RgbaFrame { width: 1, height: 1, pixels: vec![pixel; 4] }, due: Duration::from_millis(millis), duration: None })
+                .unwrap();
+        }
+        let first = Instant::now() + Duration::from_secs(2);
+        assert_eq!(player.advance(first), Some(Duration::from_millis(40)));
+        assert_eq!(player.seq(), 1);
+        assert_eq!(player.current().unwrap().pixels, [1; 4]);
+        assert_eq!(player.advance(first + Duration::from_millis(39)), Some(Duration::from_millis(1)));
+        assert_eq!(player.seq(), 1);
+        player.advance(first + Duration::from_millis(40));
+        assert_eq!(player.seq(), 2);
+        assert_eq!(player.current().unwrap().pixels, [2; 4]);
+    }
 }
