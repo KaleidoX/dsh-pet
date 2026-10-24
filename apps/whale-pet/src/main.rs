@@ -36,7 +36,7 @@ OPTIONS:
 
 CONTROLS:
     Drag the pet to move the window; click it for a reaction.
-    Ctrl+Q quits.
+    Ctrl+Q quits (macOS also accepts Command+Q).
 ";
 
 fn main() -> ExitCode {
@@ -91,6 +91,7 @@ fn run() -> Result<()> {
     };
     log::info!("asset directory {}", asset_dir.display());
 
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut fallback_to_x11 = false;
     #[cfg(target_os = "linux")]
     if !force_x11 && std::env::var_os("WAYLAND_DISPLAY").is_some() {

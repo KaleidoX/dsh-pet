@@ -2,14 +2,14 @@
 //! 640x360 canvas at native pixel size.
 //!
 //! The window is transparent except for the decoded frame. Only the pet's hit
-//! box takes clicks; everything else stays click-through. The two platforms
+//! box takes clicks; everything else stays click-through. The platforms
 //! reach that differently because their window systems do:
 //!
 //! - X11 restricts the input region with SHAPE, so the window itself only ever
 //!   sees pointer events inside the hit box.
-//! - Windows has no per-region input shape for a top-level window, so the whole
-//!   window switches between `WS_EX_TRANSPARENT | WS_EX_LAYERED` and normal
-//!   as the pointer enters and leaves the hit box. Per-pixel transparency there
+//! - Windows and macOS switch the whole window between interactive and
+//!   click-through as the pointer enters and leaves the hit box.
+//! - Windows uses `WS_EX_TRANSPARENT | WS_EX_LAYERED`. Per-pixel transparency there
 //!   additionally needs a DirectComposition swapchain and a window created
 //!   without a DWM redirection surface.
 //!
@@ -25,18 +25,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use eframe::egui;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use egui::{Pos2, Vec2};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use pet_config::HIT_BOX;
 use pet_config::{CANVAS_H, CANVAS_W, PetConfig, WorldArea};
 use pet_overlay::{PetScene, SceneLayout};
-use pet_ui_core::{FrameInput, PetCore, anchor_position};
+use pet_ui_core::{FrameInput, PetCore};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
 #[cfg(target_os = "linux")]
 mod x11;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// How often the work area is re-read (a panel may be added or resized).
 const WORLD_REFRESH: Duration = Duration::from_secs(2);
@@ -68,9 +71,16 @@ pub fn run(asset_dir: PathBuf, config: PetConfig, options: RunOptions) -> eframe
         .with_active(false)
         .with_window_level(egui::WindowLevel::AlwaysOnTop);
 
-    // Only the Linux path customises the options below.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut native = eframe::NativeOptions { viewport, persist_window: false, ..Default::default() };
+
+    #[cfg(target_os = "macos")]
+    {
+        native.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS as _};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+            builder.with_activate_ignoring_other_apps(false);
+        }));
+    }
 
     #[cfg(target_os = "linux")]
     if options.force_x11 && std::env::var_os("DISPLAY").is_some() {
@@ -111,7 +121,6 @@ struct PetApp {
     core: PetCore,
     window: Arc<Window>,
     ppp: f32,
-    last_pos: PhysicalPosition<i32>,
     /// Monitor work area in physical pixels; the pet roams inside it and the
     /// overlay menu is clamped to it.
     world: WorldArea,
@@ -119,25 +128,27 @@ struct PetApp {
     /// Pet and controls composed synchronously in this window.
     scene: PetScene,
     layout: SceneLayout,
-    /// Where the configured corner/margins put the window. KWin ignores moves
-    /// issued before the window is mapped, so this is re-applied for a short
-    /// while after startup (and dropped once the user drags the pet).
-    target_pos: Option<PhysicalPosition<i32>>,
+    #[cfg(target_os = "macos")]
+    last_position_request: Option<(i32, i32)>,
+    #[cfg(target_os = "macos")]
+    position_retries: u8,
     /// Re-assert always-on-top until this instant (KWin ignores the creation-time
     /// hint under XWayland, but honours a runtime request).
     on_top_until: Instant,
     on_top_next: Instant,
     #[cfg(target_os = "linux")]
     x11: Option<x11::X11>,
-    /// Windows: whether the window currently ignores the pointer. The whole
+    /// Whether the window currently ignores the pointer. The whole
     /// window is either interactive or click-through, so this has to follow the
     /// pointer in and out of the hit box.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     passthrough: bool,
-    /// Windows: the global left button state on the previous frame, used to
+    /// The global left button state on the previous frame, used to
     /// notice a press the window itself never saw.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pointer_down: bool,
+    #[cfg(target_os = "macos")]
+    pointer_monitor: macos::PointerMonitor,
 }
 
 impl PetApp {
@@ -148,7 +159,7 @@ impl PetApp {
         // The window is not visible yet; fixing the composed physical size now
         // avoids the first-frame `InnerSize` round trip and the compositor never
         // sees the placeholder size.
-        let mut layout = SceneLayout::new(ppp);
+        let mut layout = if cfg!(target_os = "macos") { SceneLayout::compact(ppp) } else { SceneLayout::new(ppp) };
         let _ = window.request_inner_size(PhysicalSize::new(layout.size.0, layout.size.1));
 
         #[cfg(target_os = "linux")]
@@ -171,7 +182,14 @@ impl PetApp {
         let world = read_world(&window, x11.as_ref());
         #[cfg(not(target_os = "linux"))]
         let world = read_world(&window);
-        let requested = place_window(&window, &config.position(), world, &mut layout);
+        let scene = PetScene::new(&asset_dir, &config);
+        let mut core = PetCore::new(asset_dir, &config, options.stats)?;
+        #[cfg(target_os = "macos")]
+        core.set_position_step(window.scale_factor() as f32);
+        core.prepare_view(world, ppp);
+        let requested = layout.place(core.canvas_origin(), world);
+        let requested = PhysicalPosition::new(requested.0, requested.1);
+        window.set_outer_position(requested);
         window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
 
         // Even without decorations DWM draws a thin frame and shadow around the
@@ -190,15 +208,12 @@ impl PetApp {
             }
         }
 
-        let scene = PetScene::new(&asset_dir, &config);
-        let core = PetCore::new(asset_dir, &config, options.stats)?;
-
-        let last_pos = window.outer_position().unwrap_or(requested);
+        let observed = window.outer_position().unwrap_or(requested);
         let now = Instant::now();
         log::info!(
             "window at {},{} ({}x{} physical), canvas {}x{} at {:?}, scale {ppp}, idle clip {}",
-            last_pos.x,
-            last_pos.y,
+            observed.x,
+            observed.y,
             layout.size.0,
             layout.size.1,
             CANVAS_W,
@@ -209,25 +224,31 @@ impl PetApp {
         if options.stats && !cfg!(target_os = "linux") {
             log::warn!("--stats is only implemented on Linux");
         }
+        #[cfg(target_os = "macos")]
+        let pointer_monitor = macos::PointerMonitor::new(cc.egui_ctx.clone(), &window, layout, core.canvas_origin())?;
 
         Ok(Self {
             core,
             window,
             ppp,
-            last_pos,
             world,
             world_read: now,
             scene,
             layout,
-            target_pos: Some(requested),
+            #[cfg(target_os = "macos")]
+            last_position_request: None,
+            #[cfg(target_os = "macos")]
+            position_retries: 0,
             on_top_until: now + Duration::from_secs(2),
             on_top_next: now,
             #[cfg(target_os = "linux")]
             x11,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             passthrough: false,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             pointer_down: false,
+            #[cfg(target_os = "macos")]
+            pointer_monitor,
         })
     }
 
@@ -241,6 +262,8 @@ impl PetApp {
             let world = read_world(&self.window);
             self.world = world;
             self.world_read = now;
+            #[cfg(target_os = "macos")]
+            self.pointer_monitor.refresh_screen();
         }
         let (pressed, released, secondary_pressed, local, dt) = ctx.input(|input| {
             (
@@ -252,13 +275,12 @@ impl PetApp {
             )
         });
 
-        // See `fold_global_pointer`: on Windows the global read can supply both
+        // See `fold_global_pointer`: the global read can supply both
         // the position and a press the window never saw.
-        #[cfg(target_os = "windows")]
-        let (pressed, local) = self.fold_global_pointer(pressed, local);
-
         let (global, button_down) = self.global_pointer();
-        let origin = self.window.outer_position().unwrap_or(self.last_pos);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let (pressed, local) = self.fold_global_pointer(pressed, local, global, button_down);
+        let origin = self.window_origin();
         FrameInput {
             now,
             dt,
@@ -269,7 +291,7 @@ impl PetApp {
             secondary_pressed,
             global,
             button_down,
-            window_origin: (origin.x, origin.y),
+            window_origin: origin,
             world: self.world,
         }
     }
@@ -294,50 +316,100 @@ impl PetApp {
         if let Some((x, y, down)) = pet_win32::pointer() {
             return (Some((x as f32, y as f32)), Some(down));
         }
+        #[cfg(target_os = "macos")]
+        if let Some((x, y, down)) = macos::pointer(&self.window) {
+            return (Some((x as f32, y as f32)), Some(down));
+        }
         (None, None)
     }
 
-    /// Windows only: fill in a press and position that egui never saw.
+    /// Fill in a press and position that egui never saw.
     ///
     /// While the window is click-through it gets no pointer events at all, so
     /// egui's position is whatever it was when the pointer left the window; a
     /// press arriving after the pointer re-enters the hit box would then be
     /// tested against that stale position and dropped. The global cursor read is
     /// authoritative here, and its button state gives the press edge.
-    #[cfg(target_os = "windows")]
-    fn fold_global_pointer(&mut self, pressed: bool, local: Option<Pos2>) -> (bool, Option<Pos2>) {
-        let Some((x, y, down)) = pet_win32::pointer() else { return (pressed, local) };
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn fold_global_pointer(&mut self, pressed: bool, local: Option<Pos2>, global: Option<(f32, f32)>, down: Option<bool>) -> (bool, Option<Pos2>) {
+        let (Some((x, y)), Some(down)) = (global, down) else { return (pressed, local) };
         let rising = down && !self.pointer_down;
         self.pointer_down = down;
-        let origin = self.window.outer_position().unwrap_or(self.last_pos);
-        let canvas = Vec2::new((x - origin.x) as f32, (y - origin.y) as f32);
+        let origin = self.window_origin();
+        let canvas = Vec2::new(x - origin.0 as f32, y - origin.1 as f32);
         let local = Some(Pos2::new(canvas.x / self.ppp, canvas.y / self.ppp));
         (pressed || (rising && !self.core.has_press()), local)
     }
 
-    /// Windows only: keep the window interactive exactly while the pointer is
+    /// Keep the window interactive exactly while the pointer is
     /// over the hit box (or a press is in progress).
     ///
-    /// `WS_EX_TRANSPARENT | WS_EX_LAYERED` applies to the whole window, and once
-    /// it is set the window no longer receives pointer events, so the position
+    /// Windows transparent styles and macOS `ignoresMouseEvents` apply to the
+    /// whole window. It no longer receives pointer events, so the position
     /// has to come from the global cursor read rather than from egui.
-    #[cfg(target_os = "windows")]
-    fn update_passthrough(&mut self, ctx: &egui::Context) {
-        let Some((x, y, _down)) = pet_win32::pointer() else { return };
-        let origin = self.window.outer_position().unwrap_or(self.last_pos);
-        let canvas_x = (x - origin.x) as f32;
-        let canvas_y = (y - origin.y) as f32;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn update_passthrough(&mut self, ctx: &egui::Context, global: Option<(f32, f32)>) {
+        let Some((x, y)) = global else { return };
+        let origin = self.core.canvas_origin();
+        let canvas_x = x - origin.0 as f32;
+        let canvas_y = y - origin.1 as f32;
         // A press keeps the window interactive even after the pointer leaves the
         // hit box: winit installed the mouse capture on button-down, and a
         // click-through window would never see the release.
-        let passthrough = !self.core.has_press()
-            && !self.scene.menu_open()
-            && !HIT_BOX.contains(canvas_x - self.layout.offset.0 as f32, canvas_y - self.layout.offset.1 as f32);
+        let passthrough = !self.core.has_press() && !self.scene.menu_open() && !HIT_BOX.contains(canvas_x, canvas_y);
         if passthrough != self.passthrough {
             log::debug!("passthrough {passthrough}");
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
             self.passthrough = passthrough;
         }
+    }
+
+    fn window_origin(&self) -> (i32, i32) {
+        self.layout.window_origin(self.core.canvas_origin())
+    }
+
+    /// Window geometry is an output of the video position. Readback may retry
+    /// an ignored move, but must never become another source of video position.
+    fn apply_window_position(&mut self) {
+        let origin = self.window_origin();
+        let requested = PhysicalPosition::new(origin.0, origin.1);
+        let observed = self.window.outer_position().ok();
+        if observed != Some(requested) {
+            #[cfg(target_os = "macos")]
+            {
+                if self.last_position_request != Some(origin) {
+                    self.last_position_request = Some(origin);
+                    self.position_retries = 0;
+                }
+                if self.position_retries >= 3 {
+                    return;
+                }
+                self.position_retries += 1;
+            }
+            log::trace!("window position request {requested:?}, observed {observed:?}");
+            self.window.set_outer_position(requested);
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                self.last_position_request = Some(origin);
+                self.position_retries = 0;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_menu_layout(&mut self, ctx: &egui::Context) {
+        let menu = self.scene.menu_open();
+        if self.layout.is_compact() != menu {
+            return;
+        }
+        let canvas = self.core.canvas_origin();
+        self.layout = if menu { SceneLayout::new(self.ppp) } else { SceneLayout::compact(self.ppp) };
+        self.layout.place(canvas, self.world);
+        let _ = self.window.request_inner_size(PhysicalSize::new(self.layout.size.0, self.layout.size.1));
+        self.last_position_request = None;
+        self.apply_window_position();
+        ctx.request_repaint();
     }
 }
 
@@ -349,42 +421,40 @@ impl eframe::App for PetApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = Instant::now();
+        #[cfg(target_os = "macos")]
+        {
+            self.core.set_position_step(self.window.scale_factor() as f32);
+            self.sync_menu_layout(&ctx);
+        }
 
         if now >= self.on_top_next && now < self.on_top_until {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-            // X11 only keeps a pre-map move if the window manager honours the
-            // position hint; KWin under XWayland does not, so the placement is
-            // re-sent once the window is mapped.
-            if let Some(target) = self.target_pos {
-                self.window.set_outer_position(target);
-                self.last_pos = target;
-            }
             self.on_top_next = now + Duration::from_millis(500);
         }
 
         let ppp = ctx.pixels_per_point();
         if (ppp - self.ppp).abs() > 0.001 {
-            let origin = self.window.outer_position().unwrap_or(self.last_pos);
-            let canvas = self.layout.canvas_origin((origin.x, origin.y));
+            let canvas = self.core.canvas_origin();
             self.ppp = ppp;
-            self.layout = SceneLayout::new(ppp);
+            #[cfg(target_os = "macos")]
+            {
+                self.world = read_world(&self.window);
+                self.world_read = now;
+            }
+            self.layout = if cfg!(target_os = "macos") && !self.scene.menu_open() { SceneLayout::compact(ppp) } else { SceneLayout::new(ppp) };
             let size = self.layout.size;
             let _ = self.window.request_inner_size(PhysicalSize::new(size.0, size.1));
-            let origin = self.layout.place(canvas, self.world);
-            self.last_pos = PhysicalPosition::new(origin.0, origin.1);
-            self.window.set_outer_position(self.last_pos);
-            self.target_pos = None;
+            #[cfg(target_os = "macos")]
+            {
+                self.last_position_request = None;
+            }
+            self.layout.place(canvas, self.world);
+            self.core.prepare_view(self.world, ppp);
+            self.apply_window_position();
         }
         let input = self.frame_input(&ctx, now);
         let out = self.scene.ui(ui, &mut self.core, input, &mut self.layout);
-        if let Some(pos) = out.move_to {
-            let pos = self.layout.window_origin(pos);
-            self.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
-            self.last_pos = PhysicalPosition::new(pos.0, pos.1);
-        }
-        if out.drag_started {
-            self.target_pos = None;
-        }
+        self.apply_window_position();
         if let Some(cursor) = out.cursor {
             ctx.set_cursor_icon(cursor);
         }
@@ -399,8 +469,15 @@ impl eframe::App for PetApp {
         if out.close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
-            #[cfg(target_os = "windows")]
-            self.update_passthrough(&ctx);
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            self.update_passthrough(&ctx, input.global);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.layout.is_compact() == self.scene.menu_open() {
+                ctx.request_repaint();
+            }
+            self.pointer_monitor.update(&self.window, self.layout, self.core.canvas_origin(), self.scene.menu_open(), self.core.has_press());
         }
     }
 }
@@ -431,6 +508,7 @@ fn read_world(window: &Window, x11: Option<&x11::X11>) -> WorldArea {
 }
 
 /// Intersection of two rectangles, `None` when they do not overlap.
+#[cfg(target_os = "linux")]
 fn intersect_world(a: WorldArea, b: WorldArea) -> Option<WorldArea> {
     let x = a.x.max(b.x);
     let y = a.y.max(b.y);
@@ -453,7 +531,12 @@ fn read_world(window: &Window) -> WorldArea {
     monitor_world(window)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn read_world(window: &Window) -> WorldArea {
+    macos::work_area(window).unwrap_or_else(|| monitor_world(window))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn read_world(window: &Window) -> WorldArea {
     monitor_world(window)
 }
@@ -474,16 +557,4 @@ fn monitor_world(window: &Window) -> WorldArea {
             WorldArea { x: 0, y: 0, width: CANVAS_W, height: CANVAS_H }
         }
     }
-}
-
-/// Places the pet window in the configured corner of the work area.
-///
-/// Margins are logical pixels (as in the web client); the work area and the
-/// resulting position are physical screen pixels.
-fn place_window(window: &Window, position: &pet_config::Position, world: WorldArea, layout: &mut SceneLayout) -> PhysicalPosition<i32> {
-    let (x, y) = anchor_position(world, position, window.scale_factor() as f32);
-    let origin = layout.place((x.round() as i32, y.round() as i32), world);
-    let pos = PhysicalPosition::new(origin.0, origin.1);
-    window.set_outer_position(pos);
-    pos
 }

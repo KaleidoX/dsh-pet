@@ -198,6 +198,7 @@ pub struct PetCore {
     name: String,
     position: Position,
     ppp: f32,
+    position_step: f32,
     world: WorldArea,
     player: Player,
     clip_name: String,
@@ -274,6 +275,7 @@ impl PetCore {
             name: config.pet_name(),
             position: config.position(),
             ppp: 1.0,
+            position_step: 1.0,
             world: WorldArea { x: 0, y: 0, width: CANVAS_W, height: CANVAS_H },
             player,
             clip_name,
@@ -311,27 +313,42 @@ impl PetCore {
         })
     }
 
+    /// Initializes the authoritative video position once the host knows its view.
+    pub fn prepare_view(&mut self, world: WorldArea, ppp: f32) {
+        self.ppp = ppp.max(0.01);
+        if world.width > 0 && world.height > 0 {
+            self.world = world;
+        }
+        if !self.placed {
+            self.pos = anchor_position(self.world, &self.position, self.ppp);
+            self.placed = true;
+        }
+    }
+
+    /// The video canvas's physical screen position, independent of its host window.
+    pub fn canvas_origin(&self) -> (i32, i32) {
+        let snap = |value: f32| ((value / self.position_step).round() * self.position_step).round() as i32;
+        (snap(self.pos.0), snap(self.pos.1))
+    }
+
+    /// The host's supported screen-position increment, in physical pixels.
+    pub fn set_position_step(&mut self, pixels: f32) {
+        if pixels.is_finite() && pixels >= 1.0 {
+            self.position_step = pixels;
+        }
+    }
+
     /// Advances input, motion and playback once per frame. The scene then places
     /// the native window and calls `paint` with the resulting canvas offset.
     pub fn update(&mut self, ui: &mut egui::Ui, input: FrameInput) -> FrameOutput {
         let mut out = FrameOutput::default();
 
-        if ui.ctx().input(|state| state.key_pressed(egui::Key::Q) && state.modifiers.command) {
+        if ui.ctx().input(|state| state.key_pressed(egui::Key::Q) && (state.modifiers.command || state.modifiers.ctrl)) {
             out.close = true;
             return out;
         }
 
-        self.ppp = input.ppp.max(0.01);
-        if input.world.width > 0 && input.world.height > 0 {
-            self.world = input.world;
-        }
-        if !self.placed {
-            self.pos = anchor_position(self.world, &self.position, self.ppp);
-            self.placed = true;
-            let pos = (self.pos.0.round() as i32, self.pos.1.round() as i32);
-            out.move_to = Some(pos);
-            self.last_reported = Some(pos);
-        }
+        self.prepare_view(input.world, input.ppp);
 
         self.update_pointer(&mut out, input);
         self.advance_clip(ui.ctx(), input.now);
@@ -749,7 +766,7 @@ impl PetCore {
             }
             None => {
                 // A gentle placement: the pet stays where the spring left it.
-                let pos = (self.pos.0.round() as i32, self.pos.1.round() as i32);
+                let pos = self.canvas_origin();
                 out.move_to = Some(pos);
                 self.last_reported = Some(pos);
             }
@@ -784,7 +801,7 @@ impl PetCore {
         let target = (gx - press.off.x - CANVAS_W as f32 / 2.0, gy - press.off.y - CANVAS_H as f32 / 2.0);
         spring.step(target, dt, self.physics.throw_power);
         self.pos = (spring.x, spring.y);
-        let pos = (spring.x.round() as i32, spring.y.round() as i32);
+        let pos = self.canvas_origin();
         if self.last_reported != Some(pos) {
             out.move_to = Some(pos);
             self.last_reported = Some(pos);
@@ -816,7 +833,7 @@ impl PetCore {
             return;
         }
         self.pos = self.target_position();
-        let pos = (self.pos.0.round() as i32, self.pos.1.round() as i32);
+        let pos = self.canvas_origin();
         if self.last_reported != Some(pos) {
             out.move_to = Some(pos);
             self.last_reported = Some(pos);
@@ -829,7 +846,7 @@ impl PetCore {
         let frame = simulation.advance(elapsed, throw_bounds(self.world), self.physics);
         self.throw = Some(simulation);
         self.pos = frame.position;
-        let pos = (self.pos.0.round() as i32, self.pos.1.round() as i32);
+        let pos = self.canvas_origin();
         if self.last_reported != Some(pos) {
             out.move_to = Some(pos);
             self.last_reported = Some(pos);
@@ -851,7 +868,7 @@ impl PetCore {
         let t = self.clip_started.map_or(0.0, |start| now.duration_since(start).as_secs_f32());
         let x = move_x(plan, t, duration);
         self.pos = (x, plan.start_y);
-        let pos = (x.round() as i32, plan.start_y.round() as i32);
+        let pos = self.canvas_origin();
         if self.last_reported != Some(pos) {
             out.move_to = Some(pos);
             self.last_reported = Some(pos);
@@ -930,7 +947,7 @@ impl PetCore {
                 ctx.request_repaint_after(Duration::from_millis(8));
             }
         }
-        // Windows has to poll the global cursor to decide whether the window is
+        // Windows polls the global cursor to decide whether the window is
         // click-through, and a click-through window receives no events that could
         // wake the loop, so the poll has to be timed rather than event-driven.
         #[cfg(target_os = "windows")]

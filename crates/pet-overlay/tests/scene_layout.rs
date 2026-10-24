@@ -1,6 +1,52 @@
 use pet_overlay::SceneLayout;
 
 #[test]
+fn compact_motion_keeps_the_image_at_the_window_origin() {
+    let world = pet_config::WorldArea { x: 0, y: 0, width: 3420, height: 2224 };
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let mut layout = SceneLayout::compact(scale);
+        assert_eq!(layout.size, (640, 360));
+        for x in -200..3600 {
+            let canvas = (x, x / 2);
+            assert_eq!(layout.place(canvas, world), canvas);
+            assert_eq!(layout.offset, (0, 0));
+        }
+    }
+}
+
+#[test]
+fn expanding_and_collapsing_controls_preserves_screen_position() {
+    let world = pet_config::WorldArea { x: 120, y: 86, width: 3300, height: 2138 };
+    for canvas in [(-80, 86), (2732, 286), (3200, 1864), (1200, 800)] {
+        let mut compact = SceneLayout::compact(2.0);
+        let mut controls = SceneLayout::new(2.0);
+        let window = controls.place(canvas, world);
+        assert_eq!(controls.canvas_origin(window), canvas);
+        let collapsed = compact.place(controls.canvas_origin(window), world);
+        assert_eq!(collapsed, canvas);
+    }
+}
+
+#[test]
+fn interaction_region_is_derived_from_the_video_screen_position() {
+    let world = pet_config::WorldArea { x: 120, y: 86, width: 3300, height: 2138 };
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        for canvas in [(-80, 86), (2732, 286), (3200, 1864), (1200, 800)] {
+            for mut layout in [SceneLayout::compact(scale), SceneLayout::new(scale)] {
+                let window = layout.place(canvas, world);
+                let hit = layout.hit_rect();
+                let min = (hit.min.x * scale + window.0 as f32, hit.min.y * scale + window.1 as f32);
+                let max = (hit.max.x * scale + window.0 as f32, hit.max.y * scale + window.1 as f32);
+                assert!((min.0 - (canvas.0 + 200) as f32).abs() < 0.01);
+                assert!((min.1 - (canvas.1 + 50) as f32).abs() < 0.01);
+                assert!((max.0 - (canvas.0 + 440) as f32).abs() < 0.01);
+                assert!((max.1 - (canvas.1 + 335) as f32).abs() < 0.01);
+            }
+        }
+    }
+}
+
+#[test]
 fn screen_edge_padding_does_not_displace_the_canvas() {
     let world = pet_config::WorldArea { x: 2160, y: 840, width: 3840, height: 2160 };
     let mut layout = SceneLayout::new(1.5);

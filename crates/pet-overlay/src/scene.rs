@@ -13,13 +13,24 @@ pub struct SceneLayout {
     pub ppp: f32,
     pub size: (u32, u32),
     pub offset: (i32, i32),
+    compact: bool,
 }
 
 impl SceneLayout {
     pub fn new(ppp: f32) -> Self {
         let ppp = ppp.max(0.01);
         let size = ((OVERLAY_W * ppp).round().max(CANVAS_W as f32) as u32, (OVERLAY_H * ppp).round().max(CANVAS_H as f32) as u32);
-        Self { ppp, size, offset: (((size.0 - CANVAS_W) / 2) as i32, ((size.1 - CANVAS_H) / 2) as i32) }
+        Self { ppp, size, offset: (((size.0 - CANVAS_W) / 2) as i32, ((size.1 - CANVAS_H) / 2) as i32), compact: false }
+    }
+
+    /// A moving pet needs no transparent control margins. Its image stays at
+    /// (0, 0), so moving the native window cannot race a compensating image move.
+    pub fn compact(ppp: f32) -> Self {
+        Self { ppp: ppp.max(0.01), size: (CANVAS_W, CANVAS_H), offset: (0, 0), compact: true }
+    }
+
+    pub fn is_compact(self) -> bool {
+        self.compact
     }
 
     pub fn offset_points(self) -> Vec2 {
@@ -41,6 +52,10 @@ impl SceneLayout {
     /// Keep controls inside the work area without changing the pet's position.
     /// Window managers may otherwise clamp the native window and move the pet.
     pub fn place(&mut self, canvas: (i32, i32), world: WorldArea) -> (i32, i32) {
+        if self.compact {
+            self.offset = (0, 0);
+            return canvas;
+        }
         let centered = Self::new(self.ppp).window_origin(canvas);
         let origin = if world.width > 0 && world.height > 0 {
             (
