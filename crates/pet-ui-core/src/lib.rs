@@ -903,9 +903,9 @@ impl PetCore {
             }
             let key = (self.play_gen, self.player.seq());
             if self.texture_key != Some(key) {
-                let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
+                let image = frame_image([frame.width, frame.height], &frame.pixels);
                 match &mut self.texture {
-                    Some(texture) if texture.size() == [frame.width, frame.height] => texture.set(image, TextureOptions::LINEAR),
+                    Some(texture) if texture.size() == [frame.width, frame.height] => texture.set_partial([0, 0], image, TextureOptions::LINEAR),
                     _ => self.texture = Some(ui.ctx().load_texture("pet-frame", image, TextureOptions::LINEAR)),
                 }
                 self.texture_key = Some(key);
@@ -1156,4 +1156,36 @@ impl Meter {
     }
 
     fn tick(&mut self, _texture_bytes: usize) {}
+}
+
+/// Premultiply without alpha-dependent branches so the frame loop can vectorize.
+/// Rounding matches ecolor's integer RGBA conversion, including alpha 0 and 255.
+fn frame_image(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
+    assert_eq!(size[0] * size[1] * 4, rgba.len());
+    let pixels = rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            let alpha = u16::from(pixel[3]);
+            let premultiply = |channel| {
+                let product = u16::from(channel) * alpha + 128;
+                ((product + (product >> 8)) >> 8) as u8
+            };
+            Color32::from_rgba_premultiplied(premultiply(pixel[0]), premultiply(pixel[1]), premultiply(pixel[2]), pixel[3])
+        })
+        .collect();
+    egui::ColorImage::new(size, pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn frame_image_matches_egui_for_every_channel_and_alpha() {
+        let mut rgba = Vec::with_capacity(256 * 256 * 4);
+        for alpha in 0..=255_u8 {
+            for value in 0..=255_u8 {
+                rgba.extend_from_slice(&[value, value.wrapping_add(85), value.wrapping_add(170), alpha]);
+            }
+        }
+        assert_eq!(super::frame_image([256, 256], &rgba), egui::ColorImage::from_rgba_unmultiplied([256, 256], &rgba));
+    }
 }
