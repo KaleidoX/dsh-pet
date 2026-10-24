@@ -433,7 +433,7 @@ impl PetConfig {
 }
 
 /// Resolves the asset root: CLI flag, environment, `<exe>/assets`, then the
-/// in-repo `dsh-pet/assets` for development builds.
+/// macOS bundle Resources/assets, then in-repo assets for development builds.
 pub fn resolve_asset_dir(cli: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(dir) = cli {
         ensure_asset_root(&dir, "--asset-dir")?;
@@ -452,6 +452,15 @@ pub fn resolve_asset_dir(cli: Option<PathBuf>) -> Result<PathBuf> {
             return Ok(candidate);
         }
         tried.push(candidate);
+
+        #[cfg(target_os = "macos")]
+        {
+            let candidate = exe_dir.join("../Resources/assets");
+            if candidate.join(WEBM_DIR).is_dir() {
+                return Ok(candidate);
+            }
+            tried.push(candidate);
+        }
     }
 
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dsh-pet/assets");

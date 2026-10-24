@@ -9,7 +9,7 @@ default-members = ["crates/*", "apps/whale-pet", "xtask"]
 egui-winit = { path = "third_party/egui-winit" }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"

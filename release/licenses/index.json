@@ -1,0 +1,208 @@
+[
+  {
+    "packages": [
+      "accesskit-0.25.1",
+      "accesskit_consumer-0.39.1",
+      "accesskit_macos-0.27.1",
+      "accesskit_winit-0.34.1"
+    ],
+    "files": [
+      {
+        "file": "AccessKit--accesskit--ce8164ba92995cfa86005b6259115e08c8244253/LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/AccessKit/accesskit/ce8164ba92995cfa86005b6259115e08c8244253/LICENSE-APACHE"
+      },
+      {
+        "file": "AccessKit--accesskit--ce8164ba92995cfa86005b6259115e08c8244253/LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/AccessKit/accesskit/ce8164ba92995cfa86005b6259115e08c8244253/LICENSE-MIT"
+      },
+      {
+        "file": "AccessKit--accesskit--ce8164ba92995cfa86005b6259115e08c8244253/LICENSE.chromium",
+        "url": "https://raw.githubusercontent.com/AccessKit/accesskit/ce8164ba92995cfa86005b6259115e08c8244253/LICENSE.chromium"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "dispatch-0.2.0"
+    ],
+    "files": [
+      {
+        "file": "dispatch-0.2.0/LICENSE-reference.txt",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt"
+      },
+      {
+        "file": "dispatch-0.2.0/Cargo.toml",
+        "url": "https://crates.io/crates/dispatch"
+      }
+    ],
+    "source_note": "Published crate contains an SPDX declaration without a license file; includes the declaration and matching license text from a related upstream component."
+  },
+  {
+    "packages": [
+      "block2-0.5.1",
+      "objc-sys-0.3.5"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "dispatch2-0.3.1"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "ffmpeg-sys-next-7.1.3"
+    ],
+    "files": [
+      {
+        "file": "ffmpeg-sys-next-7.1.3/LICENSE-reference.txt",
+        "url": "https://github.com/zmwangx/rust-ffmpeg"
+      },
+      {
+        "file": "ffmpeg-sys-next-7.1.3/Cargo.toml",
+        "url": "https://crates.io/crates/ffmpeg-sys-next"
+      }
+    ],
+    "source_note": "Published crate contains an SPDX declaration without a license file; includes the declaration and matching license text from a related upstream component."
+  },
+  {
+    "packages": [
+      "block2-0.6.2"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "ecolor-0.37.0",
+      "eframe-0.37.0",
+      "egui-0.37.0",
+      "egui-wgpu-0.37.0",
+      "egui-winit-0.37.0",
+      "egui_glow-0.37.0",
+      "egui_system_font_provider-0.37.0",
+      "emath-0.37.0",
+      "epaint-0.37.0",
+      "epaint_default_fonts-0.37.0"
+    ],
+    "files": [
+      {
+        "file": "emilk--egui--3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/emilk/egui/3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-APACHE"
+      },
+      {
+        "file": "emilk--egui--3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/emilk/egui/3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-MIT"
+      }
+    ],
+    "source_note": "License texts from the eframe source revision in this build; some sibling crates declare a revision unavailable upstream."
+  },
+  {
+    "packages": [
+      "objc2-0.6.5"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-0.5.3"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-encode-4.1.0"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "profiling-1.0.18"
+    ],
+    "files": [
+      {
+        "file": "aclysma--profiling--8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+        "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+      },
+      {
+        "file": "aclysma--profiling--8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+        "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-app-kit-0.2.2",
+      "objc2-core-data-0.2.2",
+      "objc2-core-image-0.2.2",
+      "objc2-foundation-0.2.2",
+      "objc2-metal-0.2.2",
+      "objc2-quartz-core-0.2.2"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-app-kit-0.3.2",
+      "objc2-core-foundation-0.3.2",
+      "objc2-core-graphics-0.3.2",
+      "objc2-core-text-0.3.2",
+      "objc2-foundation-0.3.2",
+      "objc2-io-surface-0.3.2",
+      "objc2-metal-0.3.2",
+      "objc2-quartz-core-0.3.2"
+    ],
+    "files": [
+      {
+        "file": "madsmtm--objc2--7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+        "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "spirv-0.4.0+sdk-1.4.341.0"
+    ],
+    "files": [
+      {
+        "file": "gfx-rs--rspirv--8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4/LICENSE",
+        "url": "https://raw.githubusercontent.com/gfx-rs/rspirv/8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4/LICENSE"
+      }
+    ]
+  }
+]

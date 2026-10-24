@@ -51,6 +51,9 @@ third_party/ffmpeg/src/
 third_party/ffmpeg/build/
 third_party/ffmpeg/out/
 
+# Generated installers; release documentation stays tracked.
+release/v*/
+
 # ── IDE / 编辑器 ──
 .idea/
 .vscode/

@@ -1,6 +1,6 @@
 # whale-pet 技术说明
 
-面向维护者的实现说明：工作区结构、构建、运行时机制与两个平台的窗口处理。
+面向维护者的实现说明：工作区结构、构建、运行时机制与各平台的窗口处理。
 产品介绍与使用方式见仓库根目录的 [README](../README.md)。
 
 ## 1. 工作区结构
@@ -12,7 +12,7 @@
 | `crates/pet-decode` | `ffmpeg-next` 流式解码 VP9-alpha WebM，按 PTS 交付 RGBA 帧，并上报容器时长；`starting_at` 从指定帧开始播放，`decode_all` 供离线工具整段遍历 |
 | `crates/pet-ui-core` | 与窗口系统无关的行为：动画链、解码推进、弹簧拖动、甩抛、漫游、Q 弹、命中测试、点击积分、菜单动作、浮层意图、姿态匹配的关键帧硬切、重绘节奏、`--stats` 计量 |
 | `crates/pet-overlay` | 共享单窗口场景、画布布局与交互控件：悬浮提示、积分粒子与卡片、级联右键菜单；不依赖具体窗口系统 |
-| `crates/pet-ui-egui` | eframe 宿主：宠物与控件共用一个主窗口、egui 事件循环、平台集成（X11 / Windows） |
+| `crates/pet-ui-egui` | eframe 宿主：宠物与控件共用一个主窗口、egui 事件循环、平台集成（X11 / Windows / macOS） |
 | `crates/pet-wayland` | 原生 Wayland 宿主：宠物与控件共用一个 layer surface、`wgpu`、`egui-wgpu`、`calloop`（仅 Linux） |
 | `crates/pet-win32` | Windows 全局指针读取、工作区查询与 DWM 边框关闭；唯一直接调用 Win32 的 crate |
 | `apps/whale-pet` | 二进制入口：参数解析、素材定位、宿主选择 |
@@ -30,30 +30,39 @@ workspace 级 lint 为 `unsafe_code = "forbid"`。`pet-win32` 与 `pet-wayland` 
 
 ### 2.1 解码库
 
-`cargo xtask build-ffmpeg --target linux|windows` 下载固定版本、校验 SHA-256 后裁剪构建：
+`cargo xtask build-ffmpeg [--target linux|windows|macos]` 下载固定版本、校验 SHA-256 后裁剪构建；省略目标时选择宿主系统：
 
 - FFmpeg 7.1.5、libvpx 1.15.0、nasm 2.16.03（版本与哈希写在 `xtask/src/main.rs`）
 - 只启用 `libvpx_vp9` 解码器、`matroska` 解复用、`vp9` 解析、`file` 协议与 `swscale`
-- 产物在 `third_party/ffmpeg/out/{linux,windows}`，每个目标有独立的源码树与安装前缀
+- 产物在 `third_party/ffmpeg/out/{linux,windows,macos}`，每个目标有独立的 libvpx 源码树、构建目录与安装前缀
   （Windows 安装会改写 `.pc` 并混入 `.dll.a`，与 Linux 共用目录会互相污染）
 - 28 线程下约 14 秒；Linux 运行时实际加载的 5 个库 strip 后约 2.9 MB
 
-libvpx 在 Windows 上不支持共享库，静态链入 `avcodec`。这些产物全部被 `.gitignore` 排除。
+libvpx 在 Windows 上不支持共享库，静态链入 `avcodec`；macOS 也使用静态 libvpx，避免额外的运行时搜索路径。
+macOS 的 FFmpeg 动态库使用仓库内安装前缀的绝对路径，本机构建后可以直接运行，移动仓库后需要重新构建解码库及应用。
+`cargo xtask package-macos` 会将实际依赖的动态库复制进应用的 `Contents/Frameworks` 并改写为包内相对引用，
+把素材放进 `Contents/Resources/assets`，生成可搬迁的 `.app` 和 DMG。包内含安装说明、项目与第三方许可、解码库源码；
+只构建当前二进制的架构，版本取自 workspace。产物在 `release/v<版本>/`，附独立 `.sha256`，默认使用 ad-hoc 签名。
+Apple Silicon 使用原生 ARM 汇编，不构建 NASM；Intel macOS 使用 NASM。需要 Xcode Command Line Tools、`make`、`pkg-config`、`curl` 和 `tar`。
+这些产物全部被 `.gitignore` 排除。
 
 ### 2.2 应用
 
 ```sh
-cargo xtask run      # release 构建并启动，自动设置 FFMPEG_DIR=out/linux
-cargo xtask check    # rustfmt --check + clippy -D warnings + pet-model tests
+cargo xtask run      # release 构建并启动，自动设置宿主平台的 FFMPEG_DIR
+cargo xtask run --debug -- --asset-dir /path/to/assets  # 开发构建，转发应用参数
+cargo xtask check    # rustfmt --check + clippy -D warnings + workspace tests
 cargo xtask anim-meta   # 重新生成 dsh-pet/assets/anim-meta.json
 ```
 
-`anim-meta` 默认写到素材根（`--asset-dir` 可覆盖），106 段约 13 秒，产物约 282 KB，生成结果字节确定。
+`anim-meta` 默认写到素材根（`--asset-dir` 可覆盖），产物约 282 KB。生成器按片名排序，固定输出布局；
+跨架构的解码/缩放实现可能使 RGB 描述子存在微小差异。macOS arm64 实测完整解码 106 段约 17 秒，
+生成结果与仓库元数据的帧数、时长、轮廓和姿态字段一致，仅 RGB 描述子不同。
 
-`check` 不代设 `FFMPEG_DIR`，需显式提供：
+`run`、`check` 和 `anim-meta` 共用宿主解码库目录，也接受显式的 `FFMPEG_DIR`：
 
 ```sh
-FFMPEG_DIR=$PWD/third_party/ffmpeg/out/linux cargo xtask check
+FFMPEG_DIR=/path/to/ffmpeg cargo xtask check
 ```
 
 `ffmpeg-sys-next` 不追踪 `FFMPEG_DIR`：切换构建目录后要删除 `target/*/build/ffmpeg-sys-next-*` 才会重新探测。
@@ -88,7 +97,7 @@ cargo build --release -p whale-pet --target x86_64-pc-windows-gnu
 Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（见 5.1），初始化失败则记 warning 并
 强制 XWayland 重试——回退时会显式选中 X11，否则 winit 会再次挑中 Wayland 并以同样原因失败。
 
-素材根解析顺序：`--asset-dir` → `WHALE_PET_ASSET_DIR` → `<exe>/assets` → 仓库内 `dsh-pet/assets`。
+素材根解析顺序：`--asset-dir` → `WHALE_PET_ASSET_DIR` → `<exe>/assets` → macOS 应用包的 `Contents/Resources/assets` → 仓库内 `dsh-pet/assets`。
 `config.jsonc` 读取失败时回退默认配置并告警；动画池为空时用内置默认动画名。
 
 窗口位置取 `pets[0].position` 的 `corner`（`top-left` / `top-right` / `bottom-left` / `bottom-right`）与
@@ -111,7 +120,10 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 解码器会丢掉 WebM 的 alpha 边流。帧转成紧密排布的 RGBA8，保持素材原生分辨率（640×360），不裁剪、不缩放。
 
 解码线程按帧的 PTS 与播放时钟交付，最多提前 120 ms 排队；UI 一次只持有一帧，内存随分辨率而非时长增长。
-贴图仅在 `(play_gen, seq)` 变化时重传。clip 播放结束后保留最后一帧，拖拽期间即使 clip 播完也保持悬空姿态。
+贴图仅在 `(play_gen, seq)` 变化时重传；同尺寸帧用局部更新复用 GPU 纹理，尺寸变化时才重新创建。
+UI 收到第一张保留帧时启动播放时钟，再通知解码线程继续预取，避免打开文件和首帧解码耗时造成开头跳帧。
+RGBA 上传前用可向量化的整数预乘转换透明度；输出与锁定 egui 的逐通道转换保持一致。
+clip 播放结束后保留最后一帧，拖拽期间即使 clip 播完也保持悬空姿态。
 
 播放规则与上游网页客户端一致：启动固定播 `idle[0]` 一次；待机池排除当前 clip；点击池不排除；
 拖动、点击播完一遍后回待机；`turn` 播完先把 `facing` 翻转（左右镜像随之切换），再进入随机链；
@@ -159,7 +171,7 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 - 光标在命中框上显示 `Grab`，拖动中显示 `Grabbing`
 - 指针停在命中框上时，浮层显示宠物名字的悬浮提示；开始拖动后提示收起
 - 右键命中框打开级联菜单（拖动过程中不响应）；菜单打开时左键被浮层接管，点面板外、按 Esc 或选完一项都会关闭
-- `Ctrl+Q` 退出
+- `Ctrl+Q` 退出；macOS 也支持 `Command+Q`
 
 ### 4.3 拖动、甩抛与漫游
 
@@ -184,7 +196,8 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 
 ### 4.4 交互浮层
 
-宠物与菜单、提示、积分卡片共用一个透明窗口，画布保持 640×360 物理像素，窗口至少为 760×480 逻辑点。
+宠物与菜单、提示、积分卡片共用一个透明窗口，画布保持 640×360 物理像素。
+macOS 日常窗口也是 640×360 物理像素，仅菜单期间扩为 760×480 逻辑点；Linux/Windows 保持扩展窗口。
 `PetScene` 统一更新核心状态、计算画布偏移并依次绘制宠物和控件；`SceneLayout` 将外层窗口限制在工作区内，
 同时保持画布的目标屏幕位置。各宿主不再创建独立 overlay 窗口或 surface。
 
@@ -208,7 +221,8 @@ Wayland 会话（存在 `WAYLAND_DISPLAY`）下默认先走原生 layer shell（
 
 按需重绘：解码下一帧到期时间；拖动、甩抛和漫游请求下一帧重绘；Q 弹期间每 8 ms 一次；
 按住未拖动时每 8 ms 轮询一次以便窗口外的释放也能被处理；可见控件与宠物在同一绘制周期更新；
-Windows 额外固定每 16 ms 轮询全局指针（见 5.3）。
+Windows 每 16 ms 重绘以轮询全局指针；macOS 由独立的轻量输入采样线程每 16 ms 读取指针，
+只有进入/离开命中区、交互区内移动或按住期间的输入变化才唤醒 UI，静止播放按视频 PTS 刷新。
 
 ## 5. 平台实现
 
@@ -277,7 +291,30 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
 交互控件：与宠物共用根窗口和 DX12 交换链。菜单打开时整窗可交互，其余时候按偏移后的宠物命中区切换穿透。
 窗口显式关闭阴影，vendored egui-winit 在创建无边框窗口时尊重 `has_shadow`。
 
-### 5.4 vendored egui-winit
+### 5.4 macOS
+
+使用 eframe/wgpu 的原生 Metal 窗口，宠物与菜单共用同一个透明、无边框、置顶窗口。
+事件循环采用 `ActivationPolicy::Accessory`，不在 Dock 中添加应用图标，也不在启动时抢占其他应用焦点。
+
+`macos.rs` 使用 objc2 AppKit 的安全接口读取 `NSEvent.mouseLocation` 与 `pressedMouseButtons`，
+即使窗口正在穿透，也能继续跟踪指针和按键。穿透策略与 Windows 共用：命中框外切换
+`ViewportCommand::MousePassthrough`（winit 映射为 `NSWindow.ignoresMouseEvents`），菜单打开或拖动按住时保持交互。
+输入采样保持每 16 ms 一次，进入命中框时可补齐位置及按下边沿；采样本身不触发持续绘制，线程随窗口退出停止并回收。
+
+位置唯一归属 `PetCore` 的视频画布坐标。首次显示先由 core 按配置和工作区初始化画布，再反算窗口位置；
+拖动、甩抛、漫游、回到初始位置、菜单切换和缩放都沿用这条链路。
+窗口原点 = 画布原点 − 画布在窗口内的偏移，命中判断 = 全局指针 − 画布原点。
+native 窗口位置读回只用于检查/重试输出命令，不回填视频位置。抛掷期间内部偏移保持 (0,0)，
+避免原生窗口平移与反向视频偏移异步呈现导致的错位。菜单展开/收起保持画布屏幕位置不变。
+macOS 画布输出按 backing scale 对齐至完整逻辑点，再由它统一推导窗口和输入位置；
+本机 2× Retina 对半逻辑点窗口位置会取整，否则奇数物理像素目标会导致不断重试。
+同一目标最多重试三次，菜单尺寸或缩放变化时重新核验；不把系统读回位置写回画布。
+
+工作区使用当前显示器的 `NSScreen.visibleFrame`，排除菜单栏与 Dock。Cocoa 点坐标先按主屏高度翻转 y，
+再乘当前窗口的 backing scale，与 winit 的 `outer_position` / `set_outer_position` 使用同一物理坐标域。
+这也适用于非主屏的负坐标；混合缩放多屏的实际拖动仍需对应硬件复验。
+
+### 5.5 vendored egui-winit
 
 `third_party/egui-winit/` 是 egui-winit 0.37.0 的原始副本，通过根 `Cargo.toml` 的 `[patch.crates-io]` 覆盖。
 本地补丁提供 `set_transparent_no_redirection_bitmap`，并让 Windows 无边框窗口尊重 `has_shadow`。
@@ -289,22 +326,27 @@ XWayland：位置由 anchor + margin 决定，层级天然在普通窗口之上�
 - 原生 Wayland 的热插拔与跨屏：layer surface 绑定单个输出，输出消失时停在最后已知几何，不会重建 surface
 - 原生 Wayland 的拖动起点必须在命中框内：输入区外的点击不产生按下事件（这正是穿透的实现方式）
 - 原生 Wayland 需要合成器提供 `zwlr_layer_shell_v1`；不提供时自动回退 XWayland
-- 浮层固定 760×480 逻辑点：三级菜单在贴边时会夹在浮层窗口内，超长列表靠滚动查看
-- 指纹/触摸、输入法未接入；只处理鼠标左键/右键与键盘 `Ctrl+Q`（菜单打开时额外处理 Esc）
+- 菜单窗口为 760×480 逻辑点：三级菜单在贴边时会夹在窗口内，超长列表靠滚动查看
+- 指纹/触摸、输入法未接入；只处理鼠标左键/右键与退出快捷键（macOS 为 `Ctrl+Q` / `Command+Q`，其余平台为 `Ctrl+Q`；菜单打开时额外处理 Esc）
 - `--stats` 仅 Linux 实现
 - 姿态匹配只决定从哪一帧进入：没有过渡动作或形变，切换代价高的组合仍是硬切。自然结束的切换会多等一次
   ui pass，因为末帧要先绘制一次
 - `anim-meta.json` 必须与素材一同发布；缺少它时所有切换都从第 0 帧开始（仍有硬切，没有淡入）。素材被换成更短的
   版本而元数据未重生成时，若选中的入场帧超出新片长，该 clip 会打 warning 并退回第 0 帧重播，不会计入解码失败
-- 飞行途中偶发的视觉震动尚未定位；逻辑轨迹测试与虚拟输出截图不能证明物理显示器上的逐帧稳定性
+- macOS 已移除飞行中同时移动窗口与反向移动画布的路径，代表性合成录制的轨迹偏差下降；素材自身动画、系统合成节奏和采集丢帧仍会影响帧间观感，不宣称所有显示器上逐帧零抖动
 - 未验证：小时级连续播放（解码线程与内存的长期行为），以及「素材替换但元数据未重生成」
   的现实场景（只验证了截短片长的构造场景与单 clip 校验）
-- 没有安装包与发布流程，只能从源码构建
+- macOS 提供本机架构的 DMG 打包入口；尚无 Developer ID 签名、公证、自动更新或其他平台的安装包
 - 只解码视频轨，没有音频
 - 未接入 dsh：余额、碎碎念、对话、系统通知、工作状态联动、HTTP 端点、占用锁、斜杠命令、设置页、托盘
   以及菜单里的 open-site / reload / set-display 都不存在；`animations.events` 只解析不使用
 
 ## 7. 验证记录
+
+macOS 14.8.9 / Apple Silicon / 2× 单屏完成 debug 与 release 构建、正式启动、透明动画、单个可见置顶窗口、
+底层窗口点击穿透、点击回应、右键级联菜单、慢拖停住、快甩与 Ctrl+Q / Command+Q 退出验证。
+`cargo xtask check`（格式、Clippy、全部已有 workspace 测试）通过；`anim-meta` 完整解码 106 段并回读自检通过。
+本次未覆盖 Intel macOS、多屏混合缩放及热插拔。
 
 以下 7.1–7.5 保留早期独立浮层实现的历史记录，其中窗口数量与尺寸不代表当前单窗口设计。
 当前单窗口版本在 Windows 虚拟机完成菜单浏览、慢拖停住与快甩复验，窗口枚举仅有一个可见宠物顶层窗口。

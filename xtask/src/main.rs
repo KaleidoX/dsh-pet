@@ -1,6 +1,6 @@
 //! Build and run helper.
 //!
-//! `cargo xtask build-ffmpeg --target linux` downloads pinned FFmpeg and libvpx
+//! `cargo xtask build-ffmpeg` downloads pinned FFmpeg and libvpx
 //! sources, verifies their checksums and builds the trimmed decoder stack under
 //! `third_party/ffmpeg/out`. Point `FFMPEG_DIR` at that directory when building
 //! the app; `cargo xtask run` does it automatically. `cargo xtask anim-meta`
@@ -45,13 +45,24 @@ fn main_impl() -> Result<()> {
         Some("build-ffmpeg") => build_ffmpeg(args),
         Some("run") => {
             let out = local_ffmpeg()?;
-            cargo_with_ffmpeg(&out, &["run", "--release", "-p", "whale-pet"])
+            let mut args = args.peekable();
+            let debug = args.peek().is_some_and(|arg| arg == "--debug");
+            if debug {
+                args.next();
+            }
+            let mut command = vec!["run".to_owned(), "-p".to_owned(), "whale-pet".to_owned()];
+            if !debug {
+                command.push("--release".to_owned());
+            }
+            command.extend(args);
+            let command = command.iter().map(String::as_str).collect::<Vec<_>>();
+            cargo_with_ffmpeg(&out, &command)
         }
         Some("check") => {
             cargo(&["fmt", "--all", "--check"])?;
-            cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
-            // The pure-logic tests need no FFmpeg build, unlike clippy above.
-            cargo(&["test", "-p", "pet-model", "--lib"])
+            let out = local_ffmpeg()?;
+            cargo_with_ffmpeg(&out, &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
+            cargo_with_ffmpeg(&out, &["test", "--workspace"])
         }
         Some("anim-meta") => {
             let out = local_ffmpeg()?;
@@ -61,16 +72,33 @@ fn main_impl() -> Result<()> {
             let command = command.iter().map(String::as_str).collect::<Vec<_>>();
             cargo_with_ffmpeg(&out, &command)
         }
+        Some("package-macos") => {
+            if std::env::consts::OS != "macos" {
+                bail!("package-macos must run on macOS");
+            }
+            let status = Command::new("python3")
+                .arg(workspace_root()?.join("scripts/package_macos.py"))
+                .args(args)
+                .env("FFMPEG_DIR", local_ffmpeg()?)
+                .status()
+                .context("run macOS packager")?;
+            if !status.success() {
+                bail!("macOS packaging failed ({status})");
+            }
+            Ok(())
+        }
         Some("-h" | "--help") | None => {
             print!(
                 "\
 cargo xtask <COMMAND>
 
 COMMANDS:
-    build-ffmpeg --target linux|windows [--jobs N]   Build the trimmed FFmpeg + libvpx stack
-    run                                              Build and run the pet with the local stack
+    build-ffmpeg [--target linux|windows|macos] [--jobs N]
+                                                     Build the trimmed decoder stack (default: host)
+    run [--debug] [-- OPTIONS]                        Build and run the pet with the local stack
     anim-meta [--asset-dir DIR]                      Regenerate assets/anim-meta.json (pose metadata)
-    check                                            rustfmt --check + clippy + pet-model tests
+    check                                            rustfmt --check + clippy + workspace tests
+    package-macos                                    Build a self-contained app and DMG
 "
             );
             Ok(())
@@ -87,13 +115,14 @@ fn cargo(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The local Linux decoder stack, checking that `build-ffmpeg` has run.
+/// The host's decoder stack, or an explicitly supplied FFmpeg installation.
 fn local_ffmpeg() -> Result<PathBuf> {
-    let out = workspace_root()?.join("third_party/ffmpeg/out/linux");
+    let target = Target::host()?;
+    let out = std::env::var_os("FFMPEG_DIR").map(PathBuf::from).unwrap_or(workspace_root()?.join("third_party/ffmpeg/out").join(target.name()));
     // libvpx is installed under its own prefix (`libvpx/`), so the FFmpeg
     // package config is what marks a finished build.
     if !out.join("lib/pkgconfig/libavcodec.pc").is_file() {
-        bail!("{} is missing; run `cargo xtask build-ffmpeg --target linux` first", out.display());
+        bail!("{} is missing; run `cargo xtask build-ffmpeg --target {}` first (or set FFMPEG_DIR)", out.display(), target.name());
     }
     Ok(out)
 }
@@ -111,32 +140,47 @@ fn cargo_with_ffmpeg(out: &Path, args: &[&str]) -> Result<()> {
 enum Target {
     Linux,
     Windows,
+    Macos,
 }
 
 impl Target {
+    fn host() -> Result<Self> {
+        match std::env::consts::OS {
+            "linux" => Ok(Self::Linux),
+            "windows" => Ok(Self::Windows),
+            "macos" => Ok(Self::Macos),
+            other => bail!("unsupported host OS {other:?}"),
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Linux => "linux",
             Self::Windows => "windows",
+            Self::Macos => "macos",
         }
     }
 }
 
 fn build_ffmpeg(mut args: impl Iterator<Item = String>) -> Result<()> {
-    let mut target = Target::Linux;
+    let mut target = Target::host()?;
     let mut jobs = std::thread::available_parallelism().map_or(4, |count| count.get());
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--target" => {
-                let value = args.next().context("--target needs linux or windows")?;
+                let value = args.next().context("--target needs linux, windows or macos")?;
                 target = match value.as_str() {
                     "linux" => Target::Linux,
                     "windows" => Target::Windows,
-                    other => bail!("unknown --target {other:?} (expected linux or windows)"),
+                    "macos" => Target::Macos,
+                    other => bail!("unknown --target {other:?} (expected linux, windows or macos)"),
                 };
             }
             "--jobs" | "-j" => {
                 jobs = args.next().context("--jobs needs a number")?.parse().context("--jobs must be a number")?;
+                if jobs == 0 {
+                    bail!("--jobs must be greater than zero");
+                }
             }
             other => bail!("unknown argument {other:?}"),
         }
@@ -155,7 +199,10 @@ fn build_ffmpeg(mut args: impl Iterator<Item = String>) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
 
-    let nasm = ensure_nasm(&dl, &src, &build)?;
+    if target == Target::Macos && std::env::consts::OS != "macos" {
+        bail!("the macOS decoder stack must be built on macOS");
+    }
+    let nasm = if target == Target::Macos && std::env::consts::ARCH == "aarch64" { PathBuf::new() } else { ensure_nasm(&dl, &src, &build)? };
     let ffmpeg_src = fetch(&dl, &src, "ffmpeg", FFMPEG_VERSION, FFMPEG_URL, FFMPEG_SHA256, "tar.xz", "")?;
     // libvpx refuses out-of-tree builds once a config.h exists, so each target
     // gets its own pristine source tree.
@@ -167,11 +214,12 @@ fn build_ffmpeg(mut args: impl Iterator<Item = String>) -> Result<()> {
     match target {
         Target::Linux => build_linux(&libvpx_src, &ffmpeg_src, &build_dir, &out, jobs, &nasm)?,
         Target::Windows => build_windows(&libvpx_src, &ffmpeg_src, &build_dir, &out, jobs, &nasm)?,
+        Target::Macos => build_macos(&libvpx_src, &ffmpeg_src, &build_dir, &out, jobs, &nasm)?,
     }
 
     println!("\nbuilt the {} stack in {}", target.name(), out.display());
     match target {
-        Target::Linux => {
+        Target::Linux | Target::Macos => {
             println!("run the app with: cargo xtask run");
             println!("or build with: FFMPEG_DIR={} cargo build -p whale-pet --release", out.display());
         }
@@ -329,6 +377,75 @@ fn build_linux(libvpx: &Path, ffmpeg: &Path, build: &Path, out: &Path, jobs: usi
             ])
             .env("PKG_CONFIG_PATH", vpx_prefix.join("lib/pkgconfig"))
             // FFmpeg's configure also probes nasm for x86 SIMD.
+            .env("PATH", prepend_path(tool_path)),
+        &[],
+    )?;
+    make(build, &[&format!("-j{jobs}")], tool_path)?;
+    make(build, &["install"], tool_path)
+}
+
+fn build_macos(libvpx: &Path, ffmpeg: &Path, build: &Path, out: &Path, jobs: usize, nasm: &Path) -> Result<()> {
+    let tool_path = nasm.parent().unwrap_or(Path::new(""));
+    let vpx_prefix = out.join("libvpx");
+    println!("==> libvpx {LIBVPX_VERSION} (macOS, {})", std::env::consts::ARCH);
+    run(
+        libvpx,
+        Command::new("./configure")
+            .arg(format!("--prefix={}", vpx_prefix.display()))
+            .args([
+                "--disable-shared",
+                "--enable-static",
+                "--enable-pic",
+                "--disable-vp8",
+                "--disable-vp9-encoder",
+                "--disable-examples",
+                "--disable-tools",
+                "--disable-docs",
+                "--disable-unit-tests",
+                "--disable-decode-perf-tests",
+                "--disable-encode-perf-tests",
+            ])
+            .env("PATH", prepend_path(tool_path)),
+        &[],
+    )?;
+    make(libvpx, &[&format!("-j{jobs}")], tool_path)?;
+    make(libvpx, &["install"], tool_path)?;
+
+    println!("==> FFmpeg {FFMPEG_VERSION} (macOS)");
+    run(
+        build,
+        Command::new(ffmpeg.join("configure"))
+            .arg(format!("--prefix={}", out.display()))
+            .args([
+                "--disable-everything",
+                "--enable-libvpx",
+                "--enable-decoder=libvpx_vp9",
+                "--enable-demuxer=matroska",
+                "--enable-parser=vp9",
+                "--enable-protocol=file",
+                "--enable-swscale",
+                "--enable-shared",
+                "--disable-static",
+                "--enable-pic",
+                "--enable-pthreads",
+                "--disable-gpl",
+                "--disable-nonfree",
+                "--disable-version3",
+                "--disable-doc",
+                "--disable-programs",
+                "--disable-avdevice",
+                "--disable-avfilter",
+                "--disable-postproc",
+                "--disable-network",
+                "--disable-autodetect",
+                "--disable-iconv",
+                "--disable-sdl2",
+                "--disable-xlib",
+                "--disable-zlib",
+                "--disable-bzlib",
+                "--disable-lzma",
+            ])
+            .env("PKG_CONFIG_PATH", vpx_prefix.join("lib/pkgconfig"))
             .env("PATH", prepend_path(tool_path)),
         &[],
     )?;

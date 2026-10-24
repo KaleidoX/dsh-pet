@@ -9,22 +9,36 @@
 
 ## 🖥️ 独立桌面应用（whale-pet）
 
-Rust + egui 实现的独立桌宠：单窗口、置顶、透明，直接播放上游的 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。支持 Linux（Wayland 原生 layer shell 与 X11/XWayland）与 Windows。
+Rust + egui 实现的独立桌宠：单窗口、置顶、透明，直接播放上游的 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。支持 Linux（Wayland 原生 layer shell 与 X11/XWayland）、Windows 与 macOS。
 
 ```sh
-cargo xtask build-ffmpeg --target linux   # 准备解码库
-cargo xtask run                           # 构建并启动
+cargo xtask build-ffmpeg   # 按当前系统准备解码库（Linux / macOS）
+cargo xtask run            # release 构建并启动
+cargo xtask run --debug    # 开发构建并启动
 ```
+
+需要 Rust 1.95+、C/C++ 编译工具、`make`、`pkg-config`、`curl` 和 `tar`；macOS 需要 Xcode Command Line Tools。
+macOS 原生构建自动选择 Apple Silicon 或 Intel 架构，解码库放在仓库内，不需要全局安装 FFmpeg。
+Windows 交叉构建方式见[技术说明](docs/whale-pet.md#23-windows-交叉编译)。
+
+macOS 可生成自带解码库与素材的拖拽安装包：
+
+```sh
+cargo xtask package-macos
+```
+
+DMG 与 SHA-256 校验文件保存在 `release/v<版本>/`。打开 DMG 后把 **Whale Pet.app** 拖进 **Applications** 即可安装。
+本机构建默认使用 ad-hoc 签名，不包含 Developer ID 签名或 Apple 公证；[安装说明](release/README.md) 随包提供。
 
 ```sh
 whale-pet [--asset-dir <DIR>] [--stats] [--force-x11 | --force-wayland]
 ```
 
 拖动可移动窗口，快速甩动会把宠物抛出去；点击命中框会被回应（飞行中点击还会弹出积分卡片），
-指针悬停显示名字，右键打开动作菜单。`Ctrl+Q` 退出。素材根默认取仓库内的 `dsh-pet/assets`，也可以用
+指针悬停显示名字，右键打开动作菜单。`Ctrl+Q` 退出（macOS 也支持 `Command+Q`）。素材根默认取仓库内的 `dsh-pet/assets`，也可以用
 `--asset-dir` 或 `WHALE_PET_ASSET_DIR` 指定位置。Wayland 会话下默认走原生 layer shell，初始化失败会自动回退 XWayland。
 
-菜单、悬浮提示与积分卡片和宠物画在同一个透明窗口里，各平台均只创建一个宠物窗口。宠物画布保持 640×360 物理像素，外层窗口至少为 760×480 逻辑点，为菜单留出透明余量；菜单打开时优先接收输入，关闭后恢复宠物命中区之外的点击穿透。
+菜单、悬浮提示与积分卡片和宠物画在同一个透明窗口里，各平台均只创建一个宠物窗口。宠物画布保持 640×360 物理像素；macOS 日常使用同尺寸窗口，仅打开菜单时扩展为 760×480 逻辑点。Linux 与 Windows 保留扩展窗口。窗口位置和命中区域统一由视频画布的屏幕位置反算；菜单打开时优先接收输入，关闭后恢复宠物命中区之外的点击穿透。
 本应用不接入 dsh：余额、碎碎念、对话、系统通知与工作状态联动都不包含在内。
 
 构建细节、平台实现限制与实测数据见 [`docs/whale-pet.md`](docs/whale-pet.md)。
