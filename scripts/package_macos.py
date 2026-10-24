@@ -16,6 +16,8 @@ import sys
 import tempfile
 import tomllib
 
+from fetch_macos_assets import prepare as prepare_mov_assets
+
 ROOT = Path(__file__).resolve().parent.parent
 APP_NAME = "Whale Pet.app"
 
@@ -195,6 +197,7 @@ def main() -> None:
                            for item in [executable, *libraries]), key=lambda value: tuple(map(int, value.split("."))))
             assets = resources / "assets"
             assets.mkdir()
+            shutil.copytree(prepare_mov_assets(), assets / "mov")
             for folder in ["webm", "fonts"]:
                 shutil.copytree(ROOT / "dsh-pet/assets" / folder, assets / folder)
             for filename in ["config.jsonc", "anim-meta.json"]:

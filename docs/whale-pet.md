@@ -9,11 +9,12 @@
 | --- | --- |
 | `crates/pet-config` | 解析上游 `config.jsonc`：动画池与分类、`moves`、`physics`、`animationWeights`、`font`、`pets[0]` 的 `position` 与 `fixedEnabled`；画布、命中框与运动常量；素材目录解析 |
 | `crates/pet-model` | 纯逻辑：随机链（`rollKind`）、分类权重、动画池、漫游规划、甩抛物理、释放速度估计、落地压缩、点击得分、拖动弹簧、Q 弹曲线；姿态描述子与切换代价（`describe_frame` / `pose_cost` / `pick_entry`） |
-| `crates/pet-decode` | `ffmpeg-next` 流式解码 VP9-alpha WebM，按 PTS 交付 RGBA 帧，并上报容器时长；`starting_at` 从指定帧开始播放，`decode_all` 供离线工具整段遍历 |
+| `crates/pet-decode` | 按 PTS 交付 WebM RGBA 帧或 macOS 原生视频缓冲区，并上报容器时长；`starting_at` 从指定帧开始播放，`decode_all` 供离线工具整段遍历 |
 | `crates/pet-ui-core` | 与窗口系统无关的行为：动画链、解码推进、弹簧拖动、甩抛、漫游、Q 弹、命中测试、点击积分、菜单动作、浮层意图、姿态匹配的关键帧硬切、重绘节奏、`--stats` 计量 |
 | `crates/pet-overlay` | 共享单窗口场景、画布布局与交互控件：悬浮提示、积分粒子与卡片、级联右键菜单；不依赖具体窗口系统 |
 | `crates/pet-ui-egui` | eframe 宿主：宠物与控件共用一个主窗口、egui 事件循环、平台集成（X11 / Windows / macOS） |
 | `crates/pet-wayland` | 原生 Wayland 宿主：宠物与控件共用一个 layer surface、`wgpu`、`egui-wgpu`、`calloop`（仅 Linux） |
+| `crates/pet-macos` | VideoToolbox 强制硬解、CVPixelBuffer 生命周期、同设备 Metal 纹理导入与 GPU alpha 转换（仅 macOS） |
 | `crates/pet-win32` | Windows 全局指针读取、工作区查询与 DWM 边框关闭；唯一直接调用 Win32 的 crate |
 | `apps/whale-pet` | 二进制入口：参数解析、素材定位、宿主选择 |
 | `tools/anim-meta` | 离线姿态元数据生成器：解码全部 WebM，写 `assets/anim-meta.json`（不进 `default-members`） |
@@ -21,10 +22,10 @@
 
 依赖方向：`pet-config → pet-model → pet-decode → pet-ui-core → pet-overlay → pet-ui-egui / pet-wayland → apps/whale-pet`；`pet-win32` 只在 Windows 目标上被 `pet-ui-egui` 引用，`pet-wayland` 只在 Linux 目标上被 `apps/whale-pet` 引用。
 
-workspace 级 lint 为 `unsafe_code = "forbid"`。`pet-win32` 与 `pet-wayland` 有意不继承 workspace lints：前者的
+workspace 级 lint 为 `unsafe_code = "forbid"`。`pet-win32`、`pet-wayland` 与 `pet-macos` 有意不继承 workspace lints：前者的
 `GetCursorPos` / `GetAsyncKeyState` / `DwmSetWindowAttribute` 与后者的
 `Instance::create_surface_unsafe`（wgpu 没有从裸 `wl_surface` 建表面的安全入口）都没有安全等价物。
-两个 crate 各自把 `unsafe` 限制在一个模块（`pet-win32` 的 Win32 封装、`pet-wayland` 的 `src/ffi.rs`）。
+平台 crate 把 `unsafe` 限制在 FFI 边界；`pet-macos` 另外封装同一 Metal 设备上的原生纹理导入。
 
 ## 2. 构建
 
@@ -66,6 +67,27 @@ FFMPEG_DIR=/path/to/ffmpeg cargo xtask check
 ```
 
 `ffmpeg-sys-next` 不追踪 `FFMPEG_DIR`：切换构建目录后要删除 `target/*/build/ffmpeg-sys-next-*` 才会重新探测。
+
+### macOS 原生视频链路
+
+`cargo xtask fetch-macos-assets` 获取上游 [assets-mov](https://github.com/PC2005-cloud/dsh-pet/releases/tag/assets-mov) 发布的 106 段 HEVC-alpha MOV，缓存在 `.tools/macos-assets/mov/`。固定 ZIP 校验和在 `scripts/fetch_macos_assets.py`；下载标签被覆盖且哈希改变时停止，不静默接受新素材。每次准备同时核对片名、ZIP CRC 和缓存内容。
+
+`cargo xtask run` 在 macOS 上自动准备缓存并传入 `WHALE_PET_MOV_DIR`；`package-macos` 将 MOV 与 WebM 一同放入应用资源目录，安装后无需下载。直接启动二进制时，MOV 默认取素材根的 `mov/`，也可显式指定：
+
+```sh
+WHALE_PET_MOV_DIR="$PWD/.tools/macos-assets/mov" target/release/whale-pet
+WHALE_PET_VIDEO_BACKEND=webm cargo xtask run
+WHALE_PET_VIDEO_BACKEND=hevc cargo xtask run
+cargo run --release -p pet-macos --example probe -- .tools/macos-assets/mov/*.mov
+```
+
+`WHALE_PET_VIDEO_BACKEND` 接受 `auto`（默认）、`webm`、`hevc`。`auto` 在 MOV 完整且首段硬解可用时启用原生链路，否则记录原因并使用 WebM；`hevc` 要求硬解成功，初始化失败直接报错，便于验证。不能仅凭 Metal 渲染推断硬解；每次创建 VideoToolbox 会话均要求硬件解码，并查询 `UsingHardwareAcceleratedVideoDecoder`，日志出现 `hardware=true` 才是确认结果。系统媒体解码服务必须可访问。
+
+原生路径为 `AVAssetReader` 压缩样本 → `VTDecompressionSession` → BGRA `CVPixelBuffer` / IOSurface → 同一 wgpu Metal 设备的 `CVMetalTextureCache` → GPU 转为 RGBA8 → egui。应用不锁定或读取每帧 CPU 像素，也不经过 `Vec<u8>` 上传。导入纹理同时持有像素缓冲区和 CVMetalTexture，直到 wgpu 退役相应 GPU 资源后释放。
+
+这份固定素材的容器标记是预乘 alpha，但 RGB 实测与原 WebM 的直通 RGB 对应。GPU shader 因此执行一次预乘，并将压缩导致的 1/255 背景残留归零；这项处理针对该素材包，不是任意 MOV 的通用色彩管理。换用其他来源的素材需重新确认 alpha 契约。
+
+打开片段时读取小型压缩样本和完整 PTS 索引，按精确 PTS 顺序输出解码帧，避免依赖 DTS 对重排深度的假设。解码后的表面继续按播放时钟只预取 120 ms，首帧由 UI 消费后才开始计时；动作切换取消旧 worker，跳入片段仍按帧索引解码并丢弃前缀，结束后保留最后一帧。离线 `decode_all` 与姿态元数据生成仍使用 WebM。
 
 ### 2.3 Windows 交叉编译
 

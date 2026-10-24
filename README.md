@@ -9,7 +9,7 @@
 
 ## 🖥️ 独立桌面应用（whale-pet）
 
-Rust + egui 实现的独立桌宠：单窗口、置顶、透明，直接播放上游的 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。支持 Linux（Wayland 原生 layer shell 与 X11/XWayland）、Windows 与 macOS。
+Rust + egui 实现的独立桌宠：单窗口、置顶、透明，播放上游透明动画；macOS 优先使用 HEVC-alpha 硬解与 Metal，其他平台使用 VP9-alpha WebM，不依赖 Node 或 Electron。只有人物区域接收点击，其余部分的点击会穿透到下层窗口。支持 Linux（Wayland 原生 layer shell 与 X11/XWayland）、Windows 与 macOS。
 
 ```sh
 cargo xtask build-ffmpeg   # 按当前系统准备解码库（Linux / macOS）
@@ -19,6 +19,8 @@ cargo xtask run --debug    # 开发构建并启动
 
 需要 Rust 1.95+、C/C++ 编译工具、`make`、`pkg-config`、`curl` 和 `tar`；macOS 需要 Xcode Command Line Tools。
 macOS 原生构建自动选择 Apple Silicon 或 Intel 架构，解码库放在仓库内，不需要全局安装 FFmpeg。
+`cargo xtask run` 在 macOS 上会下载并校验上游现成的 MOV 素材（约 79 MiB）；具备硬解能力时直接通过 Metal 显示。
+需要对照旧链路时运行 `WHALE_PET_VIDEO_BACKEND=webm cargo xtask run`，详见[原生视频链路](docs/whale-pet.md#macos-原生视频链路)。
 Windows 交叉构建方式见[技术说明](docs/whale-pet.md#23-windows-交叉编译)。
 
 macOS 可生成自带解码库与素材的拖拽安装包：

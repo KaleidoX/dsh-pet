@@ -2493,7 +2493,9 @@ checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags 2.13.2",
  "block2 0.6.2",
+ "dispatch2",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
 ]
 
@@ -2722,6 +2724,21 @@ dependencies = [
  "anyhow",
  "ffmpeg-next",
  "log",
+ "pet-macos",
+]
+
+[[package]]
+name = "pet-macos"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "cc",
+ "egui",
+ "egui-wgpu",
+ "log",
+ "objc2 0.6.5",
+ "objc2-metal 0.3.2",
+ "wgpu",
 ]
 
 [[package]]
@@ -2753,6 +2770,7 @@ dependencies = [
  "log",
  "pet-config",
  "pet-decode",
+ "pet-macos",
  "pet-model",
 ]
 
@@ -2769,6 +2787,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "pet-config",
  "pet-decode",
+ "pet-macos",
  "pet-model",
  "pet-overlay",
  "pet-ui-core",

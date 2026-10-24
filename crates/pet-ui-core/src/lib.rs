@@ -216,6 +216,10 @@ pub struct PetCore {
     /// that named this frame, so the clip is replayed from frame 0.
     entry_index: usize,
     texture: Option<egui::TextureHandle>,
+    #[cfg(target_os = "macos")]
+    native_renderer: Option<pet_macos::Renderer>,
+    #[cfg(target_os = "macos")]
+    native_assets: Option<PathBuf>,
     texture_key: Option<(u64, u64)>,
     /// Offline pose descriptors; `None` when `anim-meta.json` is missing.
     anim_meta: Option<AnimMeta>,
@@ -260,9 +264,43 @@ pub struct PetCore {
 
 impl PetCore {
     pub fn new(asset_dir: PathBuf, config: &PetConfig, stats: bool) -> Result<Self> {
+        Self::new_inner(
+            asset_dir,
+            config,
+            stats,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn with_native_renderer(
+        asset_dir: PathBuf,
+        config: &PetConfig,
+        stats: bool,
+        mov_dir: PathBuf,
+        renderer: pet_macos::Renderer,
+    ) -> Result<Self> {
+        Self::new_inner(asset_dir, config, stats, Some((mov_dir, renderer)))
+    }
+
+    fn new_inner(
+        asset_dir: PathBuf,
+        config: &PetConfig,
+        stats: bool,
+        #[cfg(target_os = "macos")] native: Option<(PathBuf, pet_macos::Renderer)>,
+    ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let (native_assets, native_renderer) = match native {
+            Some((dir, renderer)) => (Some(dir), Some(renderer)),
+            None => (None, None),
+        };
         let pools = AnimPools::from_config(config);
         let clip_name = pools.first_idle().ok_or_else(|| anyhow!("no idle animation available"))?;
-        let player = Player::new(clip_path(&asset_dir, &clip_name));
+        let path = clip_path(&asset_dir, &clip_name);
+        #[cfg(target_os = "macos")]
+        let path = if let Some(dir) = &native_assets { native_clip_path(dir, &clip_name) } else { path };
+        let player = Player::new(path);
         let anim_meta = AnimMeta::load(&asset_dir);
         let now = Instant::now();
 
@@ -286,6 +324,10 @@ impl PetCore {
             play_gen: 0,
             entry_index: 0,
             texture: None,
+            #[cfg(target_os = "macos")]
+            native_renderer,
+            #[cfg(target_os = "macos")]
+            native_assets,
             texture_key: None,
             anim_meta,
             pending_end: false,
@@ -384,11 +426,7 @@ impl PetCore {
                 (Switch::Immediate, _) => log::debug!("cut {} -> {name} immediate", self.clip_name),
             }
         }
-        self.player = if entry.0 > 0 {
-            Player::starting_at(clip_path(&self.asset_dir, &name), entry.0)
-        } else {
-            Player::new(clip_path(&self.asset_dir, &name))
-        };
+        self.player = if entry.0 > 0 { Player::starting_at(self.playback_path(&name), entry.0) } else { Player::new(self.playback_path(&name)) };
         self.entry_index = entry.0;
         self.clip_name = name;
         self.mode = mode;
@@ -903,14 +941,29 @@ impl PetCore {
             }
             let key = (self.play_gen, self.player.seq());
             if self.texture_key != Some(key) {
-                let image = frame_image([frame.width, frame.height], &frame.pixels);
-                match &mut self.texture {
-                    Some(texture) if texture.size() == [frame.width, frame.height] => texture.set_partial([0, 0], image, TextureOptions::LINEAR),
-                    _ => self.texture = Some(ui.ctx().load_texture("pet-frame", image, TextureOptions::LINEAR)),
+                match frame {
+                    pet_decode::Frame::Rgba(frame) => {
+                        let image = frame_image([frame.width, frame.height], &frame.pixels);
+                        match &mut self.texture {
+                            Some(texture) if texture.size() == [frame.width, frame.height] => {
+                                texture.set_partial([0, 0], image, TextureOptions::LINEAR)
+                            }
+                            _ => self.texture = Some(ui.ctx().load_texture("pet-frame", image, TextureOptions::LINEAR)),
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    pet_decode::Frame::Native(frame) => {
+                        if let Some(renderer) = &mut self.native_renderer
+                            && let Err(err) = renderer.update(frame)
+                        {
+                            log::error!("Metal video import failed: {err:#}");
+                            return;
+                        }
+                    }
                 }
                 self.texture_key = Some(key);
             }
-        } else if self.texture.is_some() {
+        } else if self.texture_id().is_some() {
             self.hold_since.get_or_insert(now);
         }
 
@@ -933,9 +986,25 @@ impl PetCore {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
         };
         let painter = ui.painter();
-        if let Some(current) = &self.texture {
-            painter.image(current.id(), rect, uv, Color32::WHITE);
+        if let Some(id) = self.texture_id() {
+            painter.image(id, rect, uv, Color32::WHITE);
         }
+    }
+
+    fn playback_path(&self, name: &str) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        if let Some(dir) = &self.native_assets {
+            return native_clip_path(dir, name);
+        }
+        clip_path(&self.asset_dir, name)
+    }
+
+    fn texture_id(&self) -> Option<egui::TextureId> {
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = &self.native_renderer {
+            return renderer.id();
+        }
+        self.texture.as_ref().map(|texture| texture.id())
     }
 
     fn schedule_repaint(&mut self, ctx: &egui::Context, now: Instant) {
@@ -1158,12 +1227,15 @@ impl Meter {
     fn tick(&mut self, _texture_bytes: usize) {}
 }
 
-/// Premultiply without alpha-dependent branches so the frame loop can vectorize.
+/// Use fixed-size pixels so vectorization survives release iterator specialization.
+/// `chunks_exact(4)` can leave a runtime stride in the collected iterator.
 /// Rounding matches ecolor's integer RGBA conversion, including alpha 0 and 255.
 fn frame_image(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
     assert_eq!(size[0] * size[1] * 4, rgba.len());
     let pixels = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| {
             let alpha = u16::from(pixel[3]);
             let premultiply = |channel| {
@@ -1174,6 +1246,11 @@ fn frame_image(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
         })
         .collect();
     egui::ColorImage::new(size, pixels)
+}
+
+#[cfg(target_os = "macos")]
+fn native_clip_path(asset_dir: &std::path::Path, name: &str) -> PathBuf {
+    asset_dir.join(name).with_extension("mov")
 }
 
 #[cfg(test)]

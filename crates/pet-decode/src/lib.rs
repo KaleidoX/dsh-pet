@@ -1,9 +1,10 @@
-//! Streaming WebM (VP9 + alpha) decoding.
+//! Timestamp-paced WebM (VP9 + alpha) and macOS HEVC-alpha playback.
 //!
-//! Each clip gets one decoder thread. It converts frames to RGBA at the clip's
+//! Each clip gets one decoder thread. WebM frames are converted to RGBA at the clip's
 //! native resolution and delivers them paced to the clip's presentation
 //! timestamps, staying at most 120 ms ahead of the playback clock. The UI holds
-//! one frame at a time, so memory scales with resolution rather than duration.
+//! one frame at a time. On macOS, MOV frames retain native decoder surfaces;
+//! only compressed clip samples and their PTS index are held for the whole clip.
 //!
 //! [`Player::starting_at`] begins delivery at a later frame: the decoder still
 //! decodes the frames before it (VP9 predicts from them) but drops them without
@@ -13,7 +14,11 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +38,13 @@ pub struct RgbaFrame {
     pub pixels: Vec<u8>,
 }
 
+/// A CPU frame or a retained native decoder surface.
+pub enum Frame {
+    Rgba(RgbaFrame),
+    #[cfg(target_os = "macos")]
+    Native(pet_macos::PixelBuffer),
+}
+
 /// What a whole-clip decode saw.
 #[derive(Debug, Clone, Copy)]
 pub struct ClipInfo {
@@ -43,7 +55,7 @@ pub struct ClipInfo {
 }
 
 struct Decoded {
-    frame: RgbaFrame,
+    frame: Frame,
     /// Presentation time relative to the clip's first delivered frame.
     due: Duration,
     /// Clip duration known from the container (`None` before the header is
@@ -56,11 +68,12 @@ pub struct Player {
     path: PathBuf,
     rx: mpsc::Receiver<Decoded>,
     pending: VecDeque<Decoded>,
-    current: Option<RgbaFrame>,
+    current: Option<Frame>,
     duration: Option<Duration>,
     origin: Option<Instant>,
     start_tx: Option<mpsc::Sender<Instant>>,
     disconnected: bool,
+    cancelled: Arc<AtomicBool>,
     seq: u64,
 }
 
@@ -78,7 +91,11 @@ impl Player {
         let (tx, rx) = mpsc::channel();
         let (start_tx, start_rx) = mpsc::channel::<Instant>();
         let thread_path = path.clone();
-        let spawn = thread::Builder::new().name("pet-decode".to_owned()).spawn(move || decode_thread(thread_path, tx, start_rx, skip_frames));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = cancelled.clone();
+        let spawn = thread::Builder::new()
+            .name("pet-decode".to_owned())
+            .spawn(move || decode_thread(thread_path, tx, start_rx, skip_frames, thread_cancelled));
         if let Err(err) = spawn {
             log::error!("cannot spawn decoder thread: {err}");
         }
@@ -91,6 +108,7 @@ impl Player {
             origin: None,
             start_tx: Some(start_tx),
             disconnected: false,
+            cancelled,
             seq: 0,
         }
     }
@@ -147,7 +165,7 @@ impl Player {
 
     /// The most recently displayed frame. Kept after the clip ends so the last
     /// frame can stay on screen (dragging holds its final pose).
-    pub fn current(&self) -> Option<&RgbaFrame> {
+    pub fn current(&self) -> Option<&Frame> {
         self.current.as_ref()
     }
 
@@ -159,6 +177,12 @@ impl Player {
     /// True once the decoder finished and every queued frame was consumed.
     pub fn ended(&self) -> bool {
         self.disconnected && self.pending.is_empty()
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -177,16 +201,22 @@ pub fn decode_all(path: &Path, mut on_frame: impl FnMut(RgbaFrame, u64) -> bool)
     })
 }
 
-fn decode_thread(path: PathBuf, tx: mpsc::Sender<Decoded>, start_rx: mpsc::Receiver<Instant>, skip_frames: usize) {
-    if let Err(err) = stream_clip(&path, &tx, &start_rx, skip_frames) {
+fn decode_thread(path: PathBuf, tx: mpsc::Sender<Decoded>, start_rx: mpsc::Receiver<Instant>, skip_frames: usize, cancelled: Arc<AtomicBool>) {
+    if let Err(err) = stream_clip(&path, &tx, &start_rx, skip_frames, &cancelled) {
         log::error!("decode {}: {err:#}", path.display());
     }
 }
 
-fn stream_clip(path: &Path, tx: &mpsc::Sender<Decoded>, start_rx: &mpsc::Receiver<Instant>, skip_frames: usize) -> Result<()> {
+fn stream_clip(
+    path: &Path,
+    tx: &mpsc::Sender<Decoded>,
+    start_rx: &mpsc::Receiver<Instant>,
+    skip_frames: usize,
+    cancelled: &AtomicBool,
+) -> Result<()> {
     let mut base: Option<f64> = None;
     let mut origin: Option<Instant> = None;
-    walk_frames(path, skip_frames, |frame, pts, duration| {
+    stream_frames(path, skip_frames, cancelled, |frame, pts, duration| {
         // The first delivered frame is the playback origin; earlier frames were
         // skipped by the walker.
         let base = *base.get_or_insert(pts);
@@ -206,6 +236,36 @@ fn stream_clip(path: &Path, tx: &mpsc::Sender<Decoded>, start_rx: &mpsc::Receive
         }
         // A send error means the UI dropped the player (animation switch).
         Ok(tx.send(Decoded { frame, due, duration }).is_ok())
+    })?;
+    Ok(())
+}
+
+fn stream_frames(
+    path: &Path,
+    skip: usize,
+    cancelled: &AtomicBool,
+    mut on_frame: impl FnMut(Frame, f64, Option<Duration>) -> Result<bool>,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if path.extension().is_some_and(|ext| ext == "mov") {
+        let mut decoder = pet_macos::Decoder::open(path)?;
+        let duration = (decoder.duration.is_finite() && decoder.duration > 0.0).then(|| Duration::from_secs_f64(decoder.duration));
+        let mut index = 0;
+        while !cancelled.load(Ordering::Relaxed) {
+            let Some((frame, pts)) = decoder.next_frame()? else { break };
+            let deliver = index >= skip;
+            index += 1;
+            if deliver && !on_frame(Frame::Native(frame), pts, duration)? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+    walk_frames(path, skip, |frame, pts, duration| {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        on_frame(Frame::Rgba(frame), pts, duration)
     })?;
     Ok(())
 }
@@ -341,20 +401,25 @@ mod tests {
             origin: None,
             start_tx: Some(start_tx),
             disconnected: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
             seq: 0,
         };
         for (pixel, millis) in [(1, 0), (2, 40)] {
-            tx.send(Decoded { frame: RgbaFrame { width: 1, height: 1, pixels: vec![pixel; 4] }, due: Duration::from_millis(millis), duration: None })
-                .unwrap();
+            tx.send(Decoded {
+                frame: Frame::Rgba(RgbaFrame { width: 1, height: 1, pixels: vec![pixel; 4] }),
+                due: Duration::from_millis(millis),
+                duration: None,
+            })
+            .unwrap();
         }
         let first = Instant::now() + Duration::from_secs(2);
         assert_eq!(player.advance(first), Some(Duration::from_millis(40)));
         assert_eq!(player.seq(), 1);
-        assert_eq!(player.current().unwrap().pixels, [1; 4]);
+        assert!(matches!(player.current(), Some(Frame::Rgba(frame)) if frame.pixels == [1; 4]));
         assert_eq!(player.advance(first + Duration::from_millis(39)), Some(Duration::from_millis(1)));
         assert_eq!(player.seq(), 1);
         player.advance(first + Duration::from_millis(40));
         assert_eq!(player.seq(), 2);
-        assert_eq!(player.current().unwrap().pixels, [2; 4]);
+        assert!(matches!(player.current(), Some(Frame::Rgba(frame)) if frame.pixels == [2; 4]));
     }
 }

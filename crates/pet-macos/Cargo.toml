@@ -1,0 +1,19 @@
+[package]
+name = "pet-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+anyhow.workspace = true
+log.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+objc2 = "0.6.4"
+objc2-metal = "0.3.2"
+
+[build-dependencies]
+cc = "1"

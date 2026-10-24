@@ -43,6 +43,7 @@ fn main_impl() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("build-ffmpeg") => build_ffmpeg(args),
+        Some("fetch-macos-assets") => fetch_macos_assets(),
         Some("run") => {
             let out = local_ffmpeg()?;
             let mut args = args.peekable();
@@ -56,7 +57,20 @@ fn main_impl() -> Result<()> {
             }
             command.extend(args);
             let command = command.iter().map(String::as_str).collect::<Vec<_>>();
-            cargo_with_ffmpeg(&out, &command)
+            if cfg!(target_os = "macos") {
+                fetch_macos_assets()?;
+                let status = Command::new("cargo")
+                    .args(&command)
+                    .env("FFMPEG_DIR", &out)
+                    .env("WHALE_PET_MOV_DIR", workspace_root()?.join(".tools/macos-assets/mov"))
+                    .status()?;
+                if !status.success() {
+                    bail!("cargo run failed ({status})");
+                }
+                Ok(())
+            } else {
+                cargo_with_ffmpeg(&out, &command)
+            }
         }
         Some("check") => {
             cargo(&["fmt", "--all", "--check"])?;
@@ -98,6 +112,7 @@ COMMANDS:
     run [--debug] [-- OPTIONS]                        Build and run the pet with the local stack
     anim-meta [--asset-dir DIR]                      Regenerate assets/anim-meta.json (pose metadata)
     check                                            rustfmt --check + clippy + workspace tests
+    fetch-macos-assets                               Fetch and verify upstream HEVC-alpha clips
     package-macos                                    Build a self-contained app and DMG
 "
             );
@@ -577,6 +592,14 @@ fn run(dir: &Path, command: &mut Command, extra_env: &[(&str, &Path)]) -> Result
     let status = command.current_dir(dir).stdin(Stdio::null()).status().with_context(|| format!("run {command:?}"))?;
     if !status.success() {
         bail!("command failed ({status}) in {}", dir.display());
+    }
+    Ok(())
+}
+
+fn fetch_macos_assets() -> Result<()> {
+    let status = Command::new("python3").arg(workspace_root()?.join("scripts/fetch_macos_assets.py")).status()?;
+    if !status.success() {
+        bail!("MOV asset preparation failed ({status})");
     }
     Ok(())
 }

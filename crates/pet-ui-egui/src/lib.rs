@@ -75,6 +75,8 @@ pub fn run(asset_dir: PathBuf, config: PetConfig, options: RunOptions) -> eframe
 
     #[cfg(target_os = "macos")]
     {
+        // Reduce queued image latency while native window positions move immediately.
+        native.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
         native.event_loop_builder = Some(Box::new(|builder| {
             use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS as _};
             builder.with_activation_policy(ActivationPolicy::Accessory);
@@ -183,6 +185,52 @@ impl PetApp {
         #[cfg(not(target_os = "linux"))]
         let world = read_world(&window);
         let scene = PetScene::new(&asset_dir, &config);
+        #[cfg(target_os = "macos")]
+        let mut core = {
+            let backend = std::env::var("WHALE_PET_VIDEO_BACKEND").unwrap_or_else(|_| "auto".into());
+            if !matches!(backend.as_str(), "auto" | "webm" | "hevc") {
+                return Err(anyhow!("WHALE_PET_VIDEO_BACKEND must be auto, webm or hevc"));
+            }
+            let mov_dir = std::env::var_os("WHALE_PET_MOV_DIR").map(PathBuf::from).unwrap_or_else(|| asset_dir.join("mov"));
+            let use_hevc = backend == "hevc" || (backend == "auto" && mov_dir.is_dir());
+            if use_hevc {
+                let native = (|| -> Result<pet_macos::Renderer> {
+                    for entry in std::fs::read_dir(asset_dir.join("webm"))? {
+                        let path = entry?.path();
+                        if path.extension().is_some_and(|ext| ext == "webm") {
+                            let mov = mov_dir.join(path.file_name().unwrap()).with_extension("mov");
+                            if !mov.is_file() {
+                                return Err(anyhow!("missing HEVC asset: {}", mov.display()));
+                            }
+                        }
+                    }
+                    let first = pet_model::AnimPools::from_config(&config).first_idle().ok_or_else(|| anyhow!("no idle animation"))?;
+                    // Fail or fall back before selecting a native player, rather than
+                    // leaving a transparent window if hardware is unavailable.
+                    let mut probe = pet_macos::Decoder::open(&mov_dir.join(first).with_extension("mov"))?;
+                    if probe.next_frame()?.is_none() {
+                        return Err(anyhow!("HEVC clip is empty"));
+                    }
+                    let state = cc.wgpu_render_state.clone().ok_or_else(|| anyhow!("HEVC rendering requires wgpu/Metal"))?;
+                    pet_macos::Renderer::new(state)
+                })();
+                match native {
+                    Ok(renderer) => {
+                        log::info!("video backend: HEVC-alpha hardware + Metal");
+                        PetCore::with_native_renderer(asset_dir, &config, options.stats, mov_dir, renderer)?
+                    }
+                    Err(err) if backend == "auto" => {
+                        log::warn!("HEVC unavailable ({err:#}); using WebM/libvpx");
+                        PetCore::new(asset_dir, &config, options.stats)?
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                log::info!("video backend: WebM/libvpx (set up MOV assets for hardware decoding)");
+                PetCore::new(asset_dir, &config, options.stats)?
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
         let mut core = PetCore::new(asset_dir, &config, options.stats)?;
         #[cfg(target_os = "macos")]
         core.set_position_step(window.scale_factor() as f32);
